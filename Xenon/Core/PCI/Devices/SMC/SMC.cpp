@@ -1,0 +1,964 @@
+/***************************************************************/
+/* Copyright 2025 Xenon Emulator Project. All rights reserved. */
+/***************************************************************/
+
+#include "SMC.h"
+
+#include "Base/Logging/Log.h"
+#include "Base/Config.h"
+#include "Base/Error.h"
+#include "Base/Hash.h"
+#include "Base/Thread.h"
+
+#include "EDIDData.h"
+#include "HANA_State.h"
+#include "SMC_Config.h"
+
+//
+// Registers Offsets
+//
+
+// UART Region
+#define UART_BYTE_OUT_REG 0x10
+#define UART_BYTE_IN_REG 0x14
+#define UART_STATUS_REG 0x18
+#define UART_CONFIG_REG 0x1C
+
+// SMI Region
+#define SMI_INT_STATUS_REG 0x50
+#define SMI_INT_ACK_REG 0x58
+#define SMI_INT_ENABLED_REG 0x5C
+
+// Clock Region
+#define CLCK_INT_ENABLED_REG 0x64
+#define CLCK_INT_STATUS_REG 0x6C
+
+// FIFO Region
+#define FIFO_IN_DATA_REG 0x80
+#define FIFO_IN_STATUS_REG 0x84
+#define FIFO_OUT_DATA_REG 0x90
+#define FIFO_OUT_STATUS_REG 0x94
+
+//
+// FIFO Definitions
+//
+#define FIFO_STATUS_READY 0x4
+#define FIFO_STATUS_BUSY 0x0
+
+//
+// SMI Definitions
+//
+#define SMI_INT_ENABLED 0xC
+#define SMI_INT_NONE 0x0
+#define SMI_INT_PENDING 0x10000000
+
+//
+// Clock Definitions
+//
+#define CLCK_INT_ENABLED 0x10000000
+#define CLCK_INT_READY 0x1
+#define CLCK_INT_TAKEN 0x3
+
+// Class Constructor.
+Xe::PCIDev::SMC::SMC(const std::string &deviceName, u64 size, PCIBridge *parentPCIBridge) :
+  PCIDevice(deviceName, size) {
+  LOG_INFO(SMC, "Core: Initializing...");
+
+  // Assign our parent PCI Bus pointer
+  pciBridge = parentPCIBridge;
+
+  // Assign our core sate, this is already filled with config data regarding
+  // AVPACK, PWRON Reason and TrayState
+  smcCoreState.currentUARTSystem = Base::JoaatStringHash(Config::smc.uartSystem);
+#ifdef _WIN32
+  smcCoreState.currentCOMPort = Config::smc.COMPort();
+#endif
+  smcCoreState.socketIp = Config::smc.socketIp;
+  smcCoreState.socketPort = Config::smc.socketPort;
+  smcCoreState.currAVPackType = (Xe::PCIDev::SMC_AVPACK_TYPE)Config::smc.avPackType;
+  smcCoreState.currPowerOnReason = (Xe::PCIDev::SMC_PWR_REASON)Config::smc.powerOnReason;
+  smcCoreState.currTrayState = Xe::PCIDev::SMC_TRAY_CLOSED;
+
+  // Create a new SMC PCI State
+  memset(&smcPCIState, 0, sizeof(smcPCIState));
+
+  // Set UART Status to Empty
+  smcPCIState.uartStatusReg = UART_STATUS_EMPTY;
+
+  // Set PCI Config Space registers
+  memcpy(pciConfigSpace.data, smcConfigSpaceMap, sizeof(smcConfigSpaceMap));
+
+  // Set our PCI Dev Sizes
+  pciDevSizes[0] = 0x100; // BAR0
+
+  // Create UART handle
+  switch (smcCoreState.currentUARTSystem) {
+  case "null"_j: {
+    smcCoreState.uartHandle = std::make_unique<HW_UART_NULL>();
+    break;
+  }
+  case "print"_j: {
+    smcCoreState.uartHandle = std::make_unique<HW_UART_SOCK>();
+    break;
+  }
+  case "socket"_j: {
+    smcCoreState.uartHandle = std::make_unique<HW_UART_SOCK>();
+    break;
+  }
+#ifdef _WIN32
+  case "vcom"_j: {
+    smcCoreState.uartHandle = std::make_unique<HW_UART_VCOM>();
+    break;
+  }
+#endif // _WIN32
+  default: {
+    smcCoreState.uartHandle = std::make_unique<HW_UART_NULL>();
+    break;
+  }
+  }
+  smcCoreState.uartHandle->uartPresent = true;
+
+  // Enter main execution thread.
+  smcThread = std::thread(&SMC::smcMainThread, this);
+}
+
+// Class Destructor.
+Xe::PCIDev::SMC::~SMC() {
+  LOG_INFO(SMC, "Shutting SMC down...");
+  smcThreadRunning = false;
+  // Notify the SMC worker thread so it's able to start shutdown
+  smcCV.notify_one();
+  if (smcThread.joinable())
+    smcThread.join();
+  smcCoreState.uartHandle->Shutdown();
+  smcCoreState.uartHandle.reset();
+  LOG_INFO(SMC, "Done!");
+}
+
+// PCI Read
+void Xe::PCIDev::SMC::Read(u64 readAddress, u8 *data, u64 size) {
+  const u8 regOffset = static_cast<u8>(readAddress);
+
+  std::lock_guard lock(mutex);
+  switch (regOffset) {
+  case UART_BYTE_OUT_REG: // UART Data Out Register
+    smcPCIState.uartOutReg = smcCoreState.uartHandle->Read();
+    if (smcCoreState.uartHandle->retVal) {
+      memcpy(data, &smcPCIState.uartOutReg, size);
+    }
+    break;
+  case UART_STATUS_REG: // UART Status Register
+    // First lets check if the UART has already been setup, if so, proceed to do
+    // the TX/RX.
+    smcPCIState.uartStatusReg = smcCoreState.uartHandle->ReadStatus();
+    // Check if UART is already initialized.
+    if (smcCoreState.uartHandle->SetupNeeded()) {
+      // XeLL doesn't initialize UART before sending data trough it. Initialize
+      // it first then.
+      setupUART(0x1E6); // 115200,8,N,1.
+    }
+    memcpy(data, &smcPCIState.uartStatusReg, size);
+    break;
+  case UART_CONFIG_REG: // UART Config Register
+    memcpy(data, &smcPCIState.uartConfigReg, size);
+    break;
+  case SMI_INT_STATUS_REG: // SMI INT Status Register
+    memcpy(data, &smcPCIState.smiIntPendingReg, size);
+    break;
+  case SMI_INT_ACK_REG: // SMI INT ACK Register
+    memcpy(data, &smcPCIState.smiIntAckReg, size);
+    break;
+  case SMI_INT_ENABLED_REG: // SMI INT Enabled Register
+    memcpy(data, &smcPCIState.smiIntEnabledReg, size);
+    break;
+  case FIFO_IN_STATUS_REG: // FIFO In Status Register
+    memcpy(data, &smcPCIState.fifoInStatusReg, size);
+    break;
+  case FIFO_OUT_STATUS_REG: // FIFO Out Status Register
+    memcpy(data, &smcPCIState.fifoOutStatusReg, size);
+    break;
+  case FIFO_OUT_DATA_REG: // FIFO Data Out Register
+    // Copy the data to our input buffer.
+    memcpy(data, &smcCoreState.fifoDataBuffer[smcCoreState.fifoBufferPos], size);
+    smcCoreState.fifoBufferPos += 4;
+    break;
+  default:
+    LOG_ERROR(SMC, "Unknown register being read, offset 0x{:X}", static_cast<u16>(regOffset));
+    break;
+  }
+}
+
+// PCI Config Read
+void Xe::PCIDev::SMC::ConfigRead(u64 readAddress, u8 *data, u64 size) {
+  LOG_INFO(SMC, "ConfigRead: Address = 0x{:X}, size = 0x{:X}.", readAddress, size);
+  memcpy(data, &pciConfigSpace.data[static_cast<u8>(readAddress)], size);
+}
+
+// PCI Write
+void Xe::PCIDev::SMC::Write(u64 writeAddress, const u8 *data, u64 size) {
+  const u8 regOffset = static_cast<u8>(writeAddress);
+
+  bool wakeSMC = false;
+  {
+    std::lock_guard lock(mutex);
+    switch (regOffset) {
+    case UART_BYTE_IN_REG: // UART Data In Register
+      memcpy(&smcPCIState.uartInReg, data, size);
+      smcCoreState.uartHandle->Write(*data);
+      break;
+    case UART_CONFIG_REG: // UART Config Register
+      memcpy(&smcPCIState.uartConfigReg, data, size);
+      // Check if UART is already initialized.
+      if (smcCoreState.uartHandle->SetupNeeded()) {
+        u64 tmp = 0;
+        memcpy(&tmp, data, size);
+        // Initialize UART.
+        setupUART(tmp);
+      }
+      break;
+    case SMI_INT_STATUS_REG: // SMI INT Status Register
+      memcpy(&smcPCIState.smiIntPendingReg, data, size);
+      break;
+    case SMI_INT_ACK_REG: // SMI INT ACK Register
+      memcpy(&smcPCIState.smiIntAckReg, data, size);
+      break;
+    case SMI_INT_ENABLED_REG: // SMI INT Enabled Register
+      memcpy(&smcPCIState.smiIntEnabledReg, data, size);
+      break;
+    case CLCK_INT_ENABLED_REG: // Clock INT Enabled Register
+      memcpy(&smcPCIState.clockIntEnabledReg, data, size);
+      break;
+    case CLCK_INT_STATUS_REG: // Clock INT Status Register
+      memcpy(&smcPCIState.clockIntStatusReg, data, size);
+      break;
+    case FIFO_IN_STATUS_REG: // FIFO In Status Register
+      memcpy(&smcPCIState.fifoInStatusReg, data, size);
+      if (smcPCIState.fifoInStatusReg == FIFO_STATUS_READY) { // We're about to receive a message.
+        // Reset our input buffer and buffer pointer.
+        memset(smcCoreState.fifoDataBuffer, 0, sizeof(smcCoreState.fifoDataBuffer));
+        smcCoreState.fifoBufferPos = 0;
+      } else if (smcPCIState.fifoInStatusReg == FIFO_STATUS_BUSY) {
+        // A FIFO command has been fully written, wake the SMC thread.
+        wakeSMC = true;
+      }
+      break;
+    case FIFO_OUT_STATUS_REG: // FIFO Out Status Register
+      memcpy(&smcPCIState.fifoOutStatusReg, data, size);
+      // We're about to send a reply.
+      if (smcPCIState.fifoOutStatusReg == FIFO_STATUS_READY) {
+        // Reset our FIFO buffer pointer.
+        smcCoreState.fifoBufferPos = 0;
+      }
+      break;
+    case FIFO_IN_DATA_REG: // FIFO Data In Register
+      // Copy the data to our input buffer at current position and increse buffer
+      // pointer position.
+      memcpy(&smcCoreState.fifoDataBuffer[smcCoreState.fifoBufferPos], data, size);
+      smcCoreState.fifoBufferPos += 4;
+      break;
+    default:
+      u64 tmp = 0;
+      memcpy(&tmp, data, size);
+      LOG_ERROR(SMC, "Unknown register being written, offset 0x{:X}, data 0x{:X}", 
+          static_cast<u16>(regOffset), tmp);
+      break;
+    }
+  }
+
+  // Wake the SMC thread outside the lock if a FIFO command was submitted.
+  if (wakeSMC) {
+    smcCV.notify_one();
+  }
+}
+
+// PCI MemSet
+void Xe::PCIDev::SMC::MemSet(u64 writeAddress, s32 data, u64 size) {
+  const u8 regOffset = static_cast<u8>(writeAddress);
+
+  bool wakeSMC = false;
+  {
+    std::lock_guard lock(mutex);
+    switch (regOffset) {
+    case UART_CONFIG_REG: // UART Config Register
+      memset(&smcPCIState.uartConfigReg, data, size);
+      break;
+    case UART_BYTE_IN_REG: // UART Data In Register
+      memset(&smcPCIState.uartInReg, data, size);
+      break;
+    case SMI_INT_STATUS_REG: // SMI INT Status Register
+      memset(&smcPCIState.smiIntPendingReg, data, size);
+      break;
+    case SMI_INT_ACK_REG: // SMI INT ACK Register
+      memset(&smcPCIState.smiIntAckReg, data, size);
+      break;
+    case SMI_INT_ENABLED_REG: // SMI INT Enabled Register
+      memset(&smcPCIState.smiIntEnabledReg, data, size);
+      break;
+    case CLCK_INT_ENABLED_REG: // Clock INT Enabled Register
+      memset(&smcPCIState.clockIntEnabledReg, data, size);
+      break;
+    case CLCK_INT_STATUS_REG: // Clock INT Status Register
+      memset(&smcPCIState.clockIntStatusReg, data, size);
+      break;
+    case FIFO_IN_STATUS_REG: // FIFO In Status Register
+      memset(&smcPCIState.fifoInStatusReg, data, size);
+      if (smcPCIState.fifoInStatusReg == FIFO_STATUS_READY) { // We're about to receive a message.
+        // Reset our input buffer and buffer pointer.
+        memset(&smcCoreState.fifoDataBuffer, 0, 16);
+        smcCoreState.fifoBufferPos = 0;
+      } else if (smcPCIState.fifoInStatusReg == FIFO_STATUS_BUSY) {
+        // A FIFO command has been fully written, wake the SMC thread.
+        wakeSMC = true;
+      }
+      break;
+    case FIFO_OUT_STATUS_REG: // FIFO Out Status Register
+      memset(&smcPCIState.fifoOutStatusReg, data, size);
+      // We're about to send a reply.
+      if (smcPCIState.fifoOutStatusReg == FIFO_STATUS_READY) {
+        // Reset our FIFO buffer pointer.
+        smcCoreState.fifoBufferPos = 0;
+      }
+      break;
+    case FIFO_IN_DATA_REG: // FIFO Data In Register
+      // Copy the data to our input buffer at current position and increse buffer
+      // pointer position.
+      memset(&smcCoreState.fifoDataBuffer[smcCoreState.fifoBufferPos], data, size);
+      smcCoreState.fifoBufferPos += 4;
+      break;
+    default:
+      u64 tmp = 0;
+      memset(&tmp, data, size);
+      LOG_ERROR(SMC, "Unknown register being written, offset 0x{:X}, data 0x{:X}", 
+          static_cast<u16>(regOffset), tmp);
+      break;
+    }
+  }
+
+  // Wake the SMC thread outside the lock if a FIFO command was submitted.
+  if (wakeSMC) {
+    smcCV.notify_one();
+  }
+}
+
+// PCI Config Write
+void Xe::PCIDev::SMC::ConfigWrite(u64 writeAddress, const u8 *data, u64 size) {  
+  // Check if we're being scanned
+  u64 tmp = 0;
+  memcpy(&tmp, data, size);
+  LOG_DEBUG(SMC, "ConfigWrite: Address = 0x{:X}, Data = 0x{:X}, size = 0x{:X}.", writeAddress, tmp, size);
+  if (static_cast<u8>(writeAddress) >= 0x10 && static_cast<u8>(writeAddress) < 0x34) {
+    const u32 regOffset = (static_cast<u8>(writeAddress) - 0x10) >> 2;
+    if (pciDevSizes[regOffset] != 0) {
+      if (tmp == 0xFFFFFFFF) { // PCI BAR Size discovery
+        u64 x = 2;
+        for (int idx = 2; idx < 31; idx++) {
+          tmp &= ~x;
+          x <<= 1;
+          if (x >= pciDevSizes[regOffset]) {
+            break;
+          }
+        }
+        tmp &= ~0x3;
+      }
+    }
+    if (static_cast<u8>(writeAddress) == 0x30) { // Expansion ROM Base Address
+      tmp = 0; // Register not implemented
+    }
+  }
+  
+  memcpy(&pciConfigSpace.data[static_cast<u8>(writeAddress)], &tmp, size);
+}
+
+// Setups the UART Communication at a given configuration.
+void Xe::PCIDev::SMC::setupUART(u32 uartConfig) {
+  LOG_INFO(UART, "Initializing...");
+  switch (smcCoreState.currentUARTSystem) {
+  case "null"_j: {
+    smcCoreState.uartHandle->Init(nullptr);
+    break;
+  }
+  case "print"_j: {
+    HW_UART_SOCK_CONFIG *config = new HW_UART_SOCK_CONFIG();
+    strncpy(config->ip, smcCoreState.socketIp.c_str(), sizeof(config->ip));
+    config->port = smcCoreState.socketPort;
+    config->usePrint = true;
+    smcCoreState.uartHandle->Init(config);
+    break;
+  }
+  case "socket"_j: {
+    HW_UART_SOCK_CONFIG *config = new HW_UART_SOCK_CONFIG();
+    strncpy(config->ip, smcCoreState.socketIp.c_str(), sizeof(config->ip));
+    config->port = smcCoreState.socketPort;
+    config->usePrint = false;
+    smcCoreState.uartHandle->Init(config);
+    break;
+  }
+#ifdef _WIN32
+  case "vcom"_j: {
+    HW_UART_VCOM_CONFIG *config = new HW_UART_VCOM_CONFIG();
+    strncpy(config->selectedComPort, smcCoreState.currentCOMPort.c_str(), sizeof(config->selectedComPort));
+    config->config = uartConfig;
+    smcCoreState.uartHandle->Init(config);
+    break;
+  }
+#endif // _WIN32
+  default: {
+    LOG_CRITICAL(UART, "Invalid UART type! Defaulting to null.");
+    smcCoreState.uartHandle->Init(nullptr);
+    break;
+  }
+  }
+}
+
+// SMC Main Thread
+void Xe::PCIDev::SMC::smcMainThread() {
+  Base::SetCurrentThreadName("[Xe] SMC");
+  // Set FIFO_IN_STATUS_REG to FIFO_STATUS_READY to indicate we are ready to
+  // receive a message.
+  smcPCIState.fifoInStatusReg = FIFO_STATUS_READY;
+
+  // Timer for measuring elapsed time since last Clock Interrupt.
+  std::chrono::steady_clock::time_point timerStart =
+      std::chrono::steady_clock::now();
+  
+  // Fat consoles vs Slims have different initial values for the HANA/ANA
+  u32 *hanaState = HANA_State;
+  switch (Config::highlyExperimental.consoleRevison) {
+  case Config::eConsoleRevision::Xenon:
+  case Config::eConsoleRevision::Zephyr:
+  case Config::eConsoleRevision::Falcon:
+  case Config::eConsoleRevision::Jasper:
+    hanaState = FAT_HANA_State;
+    break;
+  case Config::eConsoleRevision::Trinity:
+  case Config::eConsoleRevision::Corona:
+  case Config::eConsoleRevision::Corona4GB:
+  case Config::eConsoleRevision::Winchester:
+    hanaState = HANA_State;
+    break;
+  }
+  switch (Config::highlyExperimental.consoleRevison) {
+  case Config::eConsoleRevision::Xenon:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x01;
+    break;
+  case Config::eConsoleRevision::Zephyr:
+    // reinterpret_cast<u8*>(hanaState)[0xFE] = ... ;
+    break;
+  case Config::eConsoleRevision::Falcon:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x21;
+    break;
+  case Config::eConsoleRevision::Jasper:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x21;
+    break;
+  case Config::eConsoleRevision::Trinity:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x23;
+    break;
+  case Config::eConsoleRevision::Corona4GB:
+  case Config::eConsoleRevision::Corona:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x23;
+    break;
+  case Config::eConsoleRevision::Winchester:
+    reinterpret_cast<u8*>(hanaState)[0xFE] = 0x23;
+    break;
+  }
+  while (smcThreadRunning) {
+    MICROPROFILE_SCOPEI("[Xe::PCI]", "SMC::Loop", MP_AUTO);
+
+    // Wait for either a FIFO command or the 1ms clock tick.
+    {
+      std::unique_lock lock(mutex);
+      smcCV.wait_for(lock, std::chrono::milliseconds(1), [this] {
+        return smcPCIState.fifoInStatusReg == FIFO_STATUS_BUSY || !smcThreadRunning;
+      });
+    }
+
+    if (!smcThreadRunning)
+      break;
+
+    // The System Management Controller (SMC) does the following:
+    // * Communicates over a FIFO Queue with the kernel to execute commands and
+    // provide system info.
+    // * Does the UART/Serial communication between the console and remote
+    // Serial Device/PC.
+    // * Ticks the clock and sends an interrupt (PRIO_CLOCK) every x
+    // milliseconds.
+
+    // Core State (PowerOn Cause, SMC Ver, FAN Speed, Temps, etc...) should be
+    // already set.
+
+    /*
+            1. FIFO communication.
+    */
+
+    // This is done in simple steps:
+
+    /* Message Write (System -> SMC) */
+
+    // 1. System reads FIFO_IN_STATUS_REG to check wheter the SMC is ready to
+    // receive a command.
+    // 2. If the status is FIFO_STATUS_READY (0x4), the System proceeds, else it
+    // loops until the SMC Input Status Register is set to FIFO_STATUS_READY.
+    // 3. System then does a write to FIFO_IN_STATUS_REG setting it to
+    // FIFO_STATUS_READY. This signals the SMC that a new message/command is
+    // about to receive.
+    // 4. System does 4 32 Bit writes to FIFO_IN_DATA_REG, this is our 16 Bytes
+    // message.
+    // 5. System then does a write to FIFO_IN_STATUS_REG setting it to
+    // FIFO_STATUS_BUSY. This Signals the SMC that the message is transmitted
+    // and that it should start message processing.
+    // 6. If SMM (System Management Mode) interrupts are enabled, the SMC
+    // changes the SMI_INT_PENDING_REG to SMI_INT_PENDING and issues one
+    // signaling the System it should read the message. It also sets the
+    // FIFO_OUT_STATUS_REG to FIFO_STATUS_READY.
+
+    /* Message Read (SMC -> System) */
+
+    // Reads Proceed as following:
+    // A. Asynchronous Mode (Interrupts Enabled):
+    // 1. If an interrupt was issued (Asynchronous Mode), System reads
+    // SMI_INT_STATUS_REG to check wheter an interrupt is
+    // pending(SMI_INT_PENDING).
+    // 2. If SMI_INT_STATUS_REG == SMI_INT_PENDING, then a DPC routine is
+    // invoked in order to read the response and the SMI_INT_ACK_REG is set to
+    // 0. Else it just continues normal kernel execution.
+
+    // B. Synchronous Mode (Interrupts Disabled):
+
+    // 1. System reads FIFO_OUT_STATUS_REG to check wheter the SMC has finished
+    // processing the command. If the status is FIFO_STATUS_READY (0x4), the
+    // System proceeds, else it loops until the FIFO_OUT_STATUS_REG is set to
+    // FIFO_STATUS_READY.
+
+    // The process afterwards in both cases is the same as when the system does
+    // a command write. The diffrence resides on the Registers being used, using
+    // FIFO_OUT_STATUS_REG instead of FIFO_IN_STATUS_REG and FIFO_OUT_DATA_REG
+    // instead of FIFO_IN_DATA_REG.
+
+    // Check wheter we've received a command. If so, process it.
+    // Software sets FIFO_IN_STATUS_REG to FIFO_STATUS_BUSY after it has
+    // finished sending a command.
+    if (smcPCIState.fifoInStatusReg == FIFO_STATUS_BUSY) {
+      // This is set first as software waits for this register to become Ready
+      // in order to read a reply. Set FIFO_OUT_STATUS_REG to FIFO_STATUS_BUSY
+      smcPCIState.fifoOutStatusReg = FIFO_STATUS_BUSY;
+
+      // Set FIFO_IN_STATUS_REG to FIFO_STATUS_READY
+      smcPCIState.fifoInStatusReg = FIFO_STATUS_READY;
+
+      // Some commands does'nt have responses/interrupts.
+      bool noResponse = false;
+
+      // Note that the first byte in the response is always Command ID.
+      //
+      // Data Buffer[0] is our message ID.
+
+      {
+      std::lock_guard lock(mutex);
+      if (false) {
+        std::stringstream ss{};
+        ss << std::endl;
+        for (u64 i = 0; i != sizeof(smcCoreState.fifoDataBuffer); i += 4) {
+          for (u64 j = 0; j != 4; ++j) {
+            ss << FMT(" 0x{:02X}", static_cast<u16>(smcCoreState.fifoDataBuffer[i+j]));
+          }
+          if (i != (sizeof(smcCoreState.fifoDataBuffer) - 4))
+            ss << std::endl;
+        }
+        LOG_INFO(SMC, "FIFO Data:{}", ss.str());
+      }
+      switch (smcCoreState.fifoDataBuffer[0]) {
+      case Xe::PCIDev::SMC_PWRON_TYPE:
+        // Zero out the buffer
+        memset(&smcCoreState.fifoDataBuffer, 0, 16);
+        smcCoreState.fifoDataBuffer[0] = SMC_PWRON_TYPE;
+        smcCoreState.fifoDataBuffer[1] = smcCoreState.currPowerOnReason;
+        break;
+      case Xe::PCIDev::SMC_QUERY_RTC:
+        // Zero out the buffer
+        memset(&smcCoreState.fifoDataBuffer, 0, 16);
+        smcCoreState.fifoDataBuffer[0] = SMC_QUERY_RTC;
+        smcCoreState.fifoDataBuffer[1] = 0;
+        break;
+      case Xe::PCIDev::SMC_QUERY_TEMP_SENS:
+        smcCoreState.fifoDataBuffer[0] = SMC_QUERY_TEMP_SENS;
+        // There apepars to be 4 different 2 byte reads from this.
+        // Value 0: val1 | (val2 << 8);
+        // Value 1: val3 | (val4 << 8);
+        // Value 2: val5 | (val6 << 8);
+        // Value 3: val7 | (val8 << 8);
+        // Should be CPU, GPU, eDRAM and Chassis.
+        // TODO: Dump correct values. These where taken from free60's wiki.
+        smcCoreState.fifoDataBuffer[1] = 0x24;
+        smcCoreState.fifoDataBuffer[2] = 0x1B;
+        smcCoreState.fifoDataBuffer[3] = 0x2F;
+        smcCoreState.fifoDataBuffer[4] = 0xA4;
+        // eDRAM Temp.
+        smcCoreState.fifoDataBuffer[5] = 0x2C;
+        smcCoreState.fifoDataBuffer[6] = 0x24;
+        smcCoreState.fifoDataBuffer[7] = 0x26;
+        smcCoreState.fifoDataBuffer[8] = 0x2C;
+        break;
+      case Xe::PCIDev::SMC_QUERY_TRAY_STATE:
+        smcCoreState.fifoDataBuffer[0] = SMC_QUERY_TRAY_STATE;
+        smcCoreState.fifoDataBuffer[1] = smcCoreState.currTrayState;
+        break;
+      case Xe::PCIDev::SMC_QUERY_AVPACK:
+        smcCoreState.fifoDataBuffer[0] = SMC_QUERY_AVPACK;
+        smcCoreState.fifoDataBuffer[1] = smcCoreState.currAVPackType;
+        break;
+      case Xe::PCIDev::SMC_I2C_READ_WRITE: 
+        switch (smcCoreState.fifoDataBuffer[1]) {
+        case 0x3: // SMC_I2C_DDC_LOCK
+          LOG_INFO(SMC, "[I2C] Requested DDC Lock.");
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // Lock Succeeded.
+          break;
+        case 0x5: // SMC_I2C_DDC_UNLOCK
+          LOG_INFO(SMC, "[I2C] Requested DDC Unlock.");
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // Unlock Succeeded.
+          break;
+        case 0x10: // SMC_READ_SMBUS_I2C
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0x0;
+          if (smcCoreState.fifoDataBuffer[5] == 0xF0) {
+            // SMBus read (HANA)
+            smcCoreState.fifoDataBuffer[4] =
+              (hanaState[smcCoreState.fifoDataBuffer[6]] & 0xFF);
+            smcCoreState.fifoDataBuffer[5] =
+              ((hanaState[smcCoreState.fifoDataBuffer[6]] >> 8) & 0xFF);
+            smcCoreState.fifoDataBuffer[6] =
+              ((hanaState[smcCoreState.fifoDataBuffer[6]] >> 16) & 0xFF);
+            smcCoreState.fifoDataBuffer[7] =
+              ((hanaState[smcCoreState.fifoDataBuffer[6]] >> 24) & 0xFF);
+          } else {
+            // I2C read (PMW IC's, Audio IC's, etc...)
+            switch (smcCoreState.fifoDataBuffer[6] + (smcCoreState.fifoDataBuffer[3] == 0x8D ? 0x200 : 0x100)) { // Address
+            case 0x102:
+              smcCoreState.fifoDataBuffer[3] = 0x53;
+              smcCoreState.fifoDataBuffer[4] = 0x92;
+              smcCoreState.fifoDataBuffer[5] = 0;
+              smcCoreState.fifoDataBuffer[6] = 0;
+              break;
+            case 0x109:
+              // HPD (Hot Plug Detect) status register. Bit 1 = HPD asserted.
+              // VdpReadEEDIDBlockPartial: VdpHdmiHPD = (VdpReadI2CBusUchar(0x109) >> 1) & 1
+              // Return 0x02 so bit 1 is set → HPD asserted → EDID read proceeds.
+              smcCoreState.fifoDataBuffer[3] = 0x02;
+              smcCoreState.fifoDataBuffer[4] = 0;
+              smcCoreState.fifoDataBuffer[5] = 0;
+              smcCoreState.fifoDataBuffer[6] = 0;
+              break;
+            default:
+              LOG_WARNING(SMC, "[I2C] Reading from I2C at address {:#x}, unimplemented, returning 0.", 
+                smcCoreState.fifoDataBuffer[6] + (smcCoreState.fifoDataBuffer[3] == 0x8D ? 0x200 : 0x100));
+              smcCoreState.fifoDataBuffer[3] = 0;
+              smcCoreState.fifoDataBuffer[4] = 0;
+              smcCoreState.fifoDataBuffer[5] = 0;
+              smcCoreState.fifoDataBuffer[6] = 0;
+              break;
+            }
+          }
+          break;
+        case 0x11: { // SMC_I2C_DDC_READ
+          // DDC register addresses are 0x1xx; buf[6] = addr low byte.
+          // buf[2] low nibble = byte count requested (1 for all regs except 0x1F4).
+          u16 ddcAddr = static_cast<u16>(smcCoreState.fifoDataBuffer[6]) + 0x100;
+          auto &ddc = smcCoreState.ddcState;
+          memset(smcCoreState.fifoDataBuffer, 0, sizeof(smcCoreState.fifoDataBuffer));
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // success
+
+          switch (ddcAddr) {
+          case 0x1EC:
+            smcCoreState.fifoDataBuffer[3] = ddc.busConfig;
+            break;
+          case 0x1F2:
+            // VdpHanaDdcBusPrime and VdpHanaDdcFifoRead read this to check
+            // bit 2 (FIFO_DONE), bit 4 (BUSY), bits 5-6 (errors).
+            smcCoreState.fifoDataBuffer[3] = ddc.busStatus;
+            break;
+          case 0x1F3:
+            smcCoreState.fifoDataBuffer[3] = ddc.ctrlReg;
+            break;
+          case 0x1F4: {
+            // VdpHanaDdcFifoRead drains the FIFO in chunks of up to 13 bytes.
+            // The byte count is encoded in buf[2] low nibble by VdpReadI2CBus.
+            u8 count = smcCoreState.fifoDataBuffer[2] & 0x0F;
+            // If no count is provided max count is to be expected.
+            if (count == 0) count = 13;
+            if (count > ddc.fifoCount) count = ddc.fifoCount;
+            for (u8 i = 0; i < count; i++)
+              smcCoreState.fifoDataBuffer[3 + i] = ddc.fifoBuf[ddc.fifoReadPos++];
+            ddc.fifoCount -= count;
+            if (ddc.fifoCount == 0) {
+              ddc.busStatus &= ~0x04u; // clear FIFO_DONE once drained
+              ddc.fifoReadPos = 0;
+            }
+            LOG_DEBUG(SMC, "[DDC] FIFO drain: {} bytes, {} remaining", count, ddc.fifoCount);
+            break;
+          }
+          case 0x1F5:
+            // VdpHanaDdcFifoRead reads this when FIFO_DONE (bit 2) is clear
+            // to find how many bytes have arrived so far.
+            smcCoreState.fifoDataBuffer[3] = ddc.fifoCount;
+            break;
+          default:
+            LOG_DEBUG(SMC, "[DDC] Read: unhandled addr {:#x}", ddcAddr);
+            break;
+          }
+          LOG_DEBUG(SMC, "[DDC] Read addr={:#x} val={:#x}", ddcAddr,
+            smcCoreState.fifoDataBuffer[3]);
+          break;
+        }
+        case 0x20: // SMC_I2C_WRITE
+          LOG_WARNING(SMC, "[I2C] Write (STUB). Address = {:#x}, value = {:#x}.", smcCoreState.fifoDataBuffer[6] + 
+            (smcCoreState.fifoDataBuffer[3] == 0x8D ? 0x200 : 0x100), smcCoreState.fifoDataBuffer[7]);
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // Write Succeeded.
+          break;
+        case 0x21: { // SMC_I2C_DDC_WRITE — single-byte write to a DDC register
+          u16 ddcAddr = static_cast<u16>(smcCoreState.fifoDataBuffer[6]) + 0x100;
+          u8 ddcVal = smcCoreState.fifoDataBuffer[7];
+          auto &ddc = smcCoreState.ddcState;
+          LOG_DEBUG(SMC, "[DDC] Write: addr={:#x} val={:#x}", ddcAddr, ddcVal);
+          switch (ddcAddr) {
+          case 0x1EC:
+            // Bus recovery clock-line control. Written during VdpHanaDdcBusRecover
+            // with values 0xA0/0x80/0x90/0xB0/0x00. Just store; no side-effects needed.
+            ddc.busConfig = ddcVal;
+            break;
+          case 0x1F2:
+            // VdpCleanupHDMIDDC writes 0x60 to clear error bits 5-6 (write-1-to-clear).
+            // VdpHanaDdcBusRecover writes 0x00 (no-op in write-1-to-clear model).
+            ddc.busStatus &= ~ddcVal;
+            break;
+          case 0x1F3:
+            // VdpHanaDdcBusPrime  writes 0x09 (prime: enable FIFO, clear counts).
+            // VdpHanaDdcBusRecover writes 0x0F (full reset) then 0x0A (recover step 2).
+            ddc.ctrlReg = ddcVal;
+            if (ddcVal == 0x09 || ddcVal == 0x0F || ddcVal == 0x0A) {
+              ddc.busStatus = 0x00;
+              ddc.fifoReadPos = 0;
+              ddc.fifoCount = 0;
+              memset(ddc.fifoBuf, 0, sizeof(ddc.fifoBuf));
+            }
+            break;
+          default:
+            LOG_DEBUG(SMC, "[DDC] Write: unhandled addr {:#x}", ddcAddr);
+            break;
+          }
+          memset(smcCoreState.fifoDataBuffer, 0, sizeof(smcCoreState.fifoDataBuffer));
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // success
+          break;
+        }
+        case 0x60: // SMC_WRITE_SMBUS
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0x0;
+          hanaState[smcCoreState.fifoDataBuffer[6]] =
+            smcCoreState.fifoDataBuffer[8] |
+            (smcCoreState.fifoDataBuffer[9] << 8) |
+            (smcCoreState.fifoDataBuffer[10] << 16) |
+            (smcCoreState.fifoDataBuffer[11] << 24);
+          break;
+
+        case 0x81: { // SMC_HANA_DDC_MASTER_COMMAND
+          // VdpHanaDdcMasterCommand calls VdpWriteI2CBus(0x1ED, cmd, 7).
+          // That produces buf[1]=0x81, buf[6]=0xED (addr low), buf[7..13]=7-byte cmd.
+          //
+          // 7-byte DDC command layout (from VdpHanaDdcMasterCommand):
+          //   cmd[0] = device address (0xA0 = EDID)
+          //   cmd[1] = page           (block_num >> 1)
+          //   cmd[2] = word address   ((block_num << 7) & 0x80 → 0x00 or 0x80)
+          //   cmd[3] = count          (bytes requested, ≤ 0x80)
+          //   cmd[4] = count high     (always 0 for count ≤ 127)
+          //   cmd[5] = 0
+          //   cmd[6] = seg_ptr_mode   (2 for blocks 0-1, 4 for blocks ≥ 2)
+          auto &ddc = smcCoreState.ddcState;
+          const u8 device  = smcCoreState.fifoDataBuffer[7];
+          const u8 page    = smcCoreState.fifoDataBuffer[8];
+          const u8 waddr   = smcCoreState.fifoDataBuffer[9];
+          const u8 count   = smcCoreState.fifoDataBuffer[10];
+
+          LOG_DEBUG(SMC, "[DDC] MasterCmd: dev={:#x} page={} waddr={:#x} count={}",
+            device, page, waddr, count);
+
+          if (device == 0xA0 && count > 0 && count <= 128) {
+            // Translate DDC addressing back to a linear EDID byte offset.
+            // Each page covers 256 bytes (2 blocks of 128).
+            // word address 0x00 = first block in page, 0x80 = second block.
+            const u16 edidOffset = static_cast<u16>(page) * 256u + waddr;
+            for (u8 i = 0; i < count; i++) {
+              const u16 src = edidOffset + i;
+              ddc.fifoBuf[i] = (src < sizeof(EDIDData)) ? EDIDData[src] : 0x00;
+            }
+            ddc.fifoReadPos = 0;
+            ddc.fifoCount   = count;
+            // busStatus=0x00: kernel's VdpHanaDdcFifoRead will poll 0x1F5 for byte
+            // count and drain in ≤13-byte chunks. Setting bit 2 here causes the drain
+            // loop to skip the 0x1F5 read (v14=0) and exit with 0 bytes read.
+            ddc.busStatus = 0x00;
+          } else {
+            LOG_WARNING(SMC, "[DDC] MasterCmd: invalid params (dev={:#x} count={}), ignoring",
+              device, count);
+            ddc.fifoCount = 0;
+            ddc.busStatus = 0x00;
+          }
+
+          memset(smcCoreState.fifoDataBuffer, 0, sizeof(smcCoreState.fifoDataBuffer));
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0; // success
+        } break;
+        default:
+          LOG_WARNING(SMC, "SMC_I2C_READ_WRITE: Unimplemented command 0x{:X}", smcCoreState.fifoDataBuffer[1]);
+          smcCoreState.fifoDataBuffer[0] = SMC_I2C_READ_WRITE;
+          smcCoreState.fifoDataBuffer[1] = 0x1; // Set R/W Failed.
+        }
+        break;
+      case Xe::PCIDev::SMC_QUERY_VERSION:
+        smcCoreState.fifoDataBuffer[0] = SMC_QUERY_VERSION;
+        smcCoreState.fifoDataBuffer[1] = 0x41;
+        smcCoreState.fifoDataBuffer[2] = 0x02;
+        smcCoreState.fifoDataBuffer[3] = 0x03;
+        break;
+      case Xe::PCIDev::SMC_FIFO_TEST:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_FIFO_TEST");
+        break;
+      case Xe::PCIDev::SMC_QUERY_IR_ADDRESS:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_QUERY_IR_ADDRESS");
+        break;
+      case Xe::PCIDev::SMC_QUERY_TILT_SENSOR:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_QUERY_TILT_SENSOR");
+        break;
+      case Xe::PCIDev::SMC_READ_82_INT:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_READ_82_INT");
+        break;
+      case Xe::PCIDev::SMC_READ_8E_INT:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_READ_8E_INT");
+        break;
+      case Xe::PCIDev::SMC_SET_STANDBY:
+        smcCoreState.fifoDataBuffer[0] = SMC_SET_STANDBY;
+        // TODO: Fix other HAL types
+        if (smcCoreState.fifoDataBuffer[1] == 0x01) {
+          LOG_INFO(SMC, "[Standby] Requested shutdown");
+          XeRunning = false;
+        }
+        else if (smcCoreState.fifoDataBuffer[1] == 0x04) {
+          LOG_INFO(SMC, "[Standby] Requested reboot");
+          // Note: Real hardware only respects 0x30, but for automated testing, we will allow anything
+          // Must release lock before reboot since it may re-enter SMC.
+        } else {
+          LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD Subtype in SMC_SET_STANDBY: 0x{:02X}",
+            static_cast<u16>(smcCoreState.fifoDataBuffer[1]));
+        }
+        break;
+      case Xe::PCIDev::SMC_SET_TIME:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_TIME");
+        break;
+      case Xe::PCIDev::SMC_SET_FAN_ALGORITHM:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_FAN_ALGORITHM");
+        break;
+      case Xe::PCIDev::SMC_SET_FAN_SPEED_CPU:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_FAN_SPEED_CPU");
+        break;
+      case Xe::PCIDev::SMC_SET_DVD_TRAY:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_DVD_TRAY");
+        break;
+      case Xe::PCIDev::SMC_SET_POWER_LED:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_POWER_LED");
+        break;
+      case Xe::PCIDev::SMC_SET_AUDIO_MUTE:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_AUDIO_MUTE");
+        break;
+      case Xe::PCIDev::SMC_ARGON_RELATED:
+        LOG_WARNING(SMC, "Querying Argon EEPROM Read for errors - returning no errors.");
+        // The SMC is queried to read argon errors that may be stored on the argon's EEPROM.
+        // The return system is not as per other commands, the kernel expects a notification instead (response 0x83),
+        // and the notification type to be 0x44 (argon?), followed by the data read back from the EEPROM.
+        smcCoreState.fifoDataBuffer[0] = 0x83;
+        smcCoreState.fifoDataBuffer[1] = 0x44;
+        break;
+      case Xe::PCIDev::SMC_SET_FAN_SPEED_GPU:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_FAN_SPEED_GPU");
+        break;
+      case Xe::PCIDev::SMC_SET_IR_ADDRESS:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_IR_ADDRESS");
+        break;
+      case Xe::PCIDev::SMC_SET_DVD_TRAY_SECURE:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_DVD_TRAY_SECURE");
+        break;
+      case Xe::PCIDev::SMC_SET_FP_LEDS:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_FP_LEDS");
+        noResponse = true;
+        break;
+      case Xe::PCIDev::SMC_SET_RTC_WAKE:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_RTC_WAKE");
+        break;
+      case Xe::PCIDev::SMC_ANA_RELATED:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_ANA_RELATED");
+        break;
+      case Xe::PCIDev::SMC_SET_ASYNC_OPERATION:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_ASYNC_OPERATION");
+        break;
+      case Xe::PCIDev::SMC_SET_82_INT:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_82_INT");
+        break;
+      case Xe::PCIDev::SMC_SET_9F_INT:
+        LOG_WARNING(SMC, "Unimplemented SMC_FIFO_CMD: SMC_SET_9F_INT");
+        break;
+      default:
+        LOG_WARNING(SMC, "Unknown SMC_FIFO_CMD: ID = 0x{:X}", 
+            static_cast<u16>(smcCoreState.fifoDataBuffer[0]));
+        break;
+      }
+      }
+
+      // Handle reboot outside of lock since it may re-enter SMC.
+      if (smcCoreState.fifoDataBuffer[0] == SMC_SET_STANDBY && smcCoreState.fifoDataBuffer[1] == 0x04) {
+        XeMain::Reboot(static_cast<Xe::PCIDev::SMC_PWR_REASON>(smcCoreState.fifoDataBuffer[2]));
+      }
+
+      // Set FIFO_OUT_STATUS_REG to FIFO_STATUS_READY, signaling we're ready to
+      // transmit a response.
+      smcPCIState.fifoOutStatusReg = FIFO_STATUS_READY;
+
+      // If interrupts are active set Int status and issue one.
+      if (smcPCIState.smiIntEnabledReg & SMI_INT_ENABLED && noResponse == false) {
+        {
+          std::lock_guard lock(mutex);
+          smcPCIState.smiIntPendingReg = SMI_INT_PENDING;
+        }
+        // Route outside of the lock to avoid contention.
+        pciBridge->RouteInterrupt(PRIO_SMM);
+      }
+    }
+
+    // Measure elapsed time.
+    std::chrono::steady_clock::time_point timerNow =
+      std::chrono::steady_clock::now();
+
+    // Check for SMC Clock interrupt register.
+    // 
+    // Clock Int Enabled.
+    if (smcPCIState.clockIntEnabledReg == CLCK_INT_ENABLED) {
+      // Clock Interrupt Not Taken.
+      if (smcPCIState.clockIntStatusReg == CLCK_INT_READY) {
+        // The SMC Clock interrupt is the system timer.
+        // Reversing of the kernel shows that the clock interrupt causes 
+        // the KeTimeStampBundle structure (FILETIME format) to update 10000 units.
+        // 10000 * 100ns intervals -> 1000000ns = 1ms 
+        if (timerNow >= timerStart + 1ms) {
+          // Update internal timer
+          timerStart = timerNow;
+          {
+            std::lock_guard lock(mutex);
+            smcPCIState.clockIntStatusReg = CLCK_INT_TAKEN;
+          }
+          // Route outside the lock to avoid lock contention
+          pciBridge->RouteInterrupt(PRIO_CLOCK);
+        }
+      }
+    }
+  }
+}

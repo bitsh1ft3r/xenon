@@ -1,0 +1,164 @@
+task:
+  name: "OHCI_Controller_LLE_Xbox360"
+  objective: >
+    Implement a fully functional OHCI (Open Host Controller Interface) USB controller
+    for an Xbox 360 Low-Level Emulator using libusb as the backend.
+
+context:
+  platform:
+    name: "Xbox 360"
+    type: "console"
+  emulation_type: "LLE"
+  backend: "libusb"
+  language_target: ["C", "C++"]
+  audience: "expert_systems_programmer"
+
+global_constraints:
+  hardware_accuracy: true
+  avoid_high_level_explanations: true
+  focus: ["implementation", "correctness"]
+  endianness:
+    guest_ram_pre_swapped: true
+    allow_byteswap: false
+  existing_subsystems:
+    - CPU
+    - MMU
+    - interrupt_controller
+
+requirements:
+
+  - id: "OHCI_HARDWARE_MODEL"
+    description: "Define and model OHCI core structures and scheduling"
+    must_include:
+      structures:
+        - HCCA
+        - ED
+        - TD
+        - DoneQueue
+      details:
+        - memory_layout
+        - bit_level_behavior
+      scheduling:
+        - control
+        - bulk
+        - interrupt
+        - isochronous
+      diagrams: "ASCII_ED_TD_chains"
+
+  - id: "EMULATOR_INTEGRATION"
+    description: "Integrate OHCI into emulator core"
+    must_include:
+      mmio:
+        - read_semantics
+        - write_semantics
+        - side_effects
+      dma:
+        - fetch_descriptors
+        - writeback_results
+      interrupts:
+        - mapping_to_emulator_controller
+
+  - id: "LIBUSB_MAPPING"
+    description: "Map OHCI transfers to libusb"
+    mappings:
+      control: "libusb_control_transfer"
+      bulk: "libusb_bulk_transfer"
+      interrupt: "libusb_interrupt_transfer"
+      isochronous: "libusb_submit_transfer"
+    must_include:
+      - async_handling
+      - event_loop_strategy
+      - threading_model
+
+  - id: "EXECUTION_MODEL"
+    description: "Define frame-based execution"
+    frame_duration_ms: 1
+    must_include:
+      - periodic_traversal
+      - non_periodic_traversal
+      pseudocode:
+        - frame_start
+        - ed_traversal
+        - td_execution
+        - completion_writeback
+
+  - id: "TIMING_MODEL"
+    description: "Approximate OHCI timing"
+    must_include:
+      - host_timer_usage
+      - libusb_latency_handling
+      - emulator_clock_sync
+      - tradeoffs:
+          - accuracy
+          - performance
+
+  - id: "DMA_MEMORY_ACCESS"
+    description: "Handle guest memory interactions"
+    rules:
+      use_mmu: true
+      enforce_alignment: true
+      validate_descriptors: true
+      endianness_conversion: false
+
+  - id: "INTERRUPT_HANDLING"
+    description: "OHCI interrupt behavior"
+    must_include:
+      - done_queue_writeback
+      - interrupt_status_flags
+      - interrupt_masking
+      - trigger_conditions
+      - libusb_completion_to_interrupt
+
+  - id: "ERROR_HANDLING"
+    description: "Handle edge cases"
+    must_cover:
+      - STALL
+      - NAK
+      - timeout
+      - device_disconnect
+      - device_reconnect
+      - invalid_descriptors
+      - cancellation
+
+  - id: "CODE_STRUCTURE"
+    description: "Provide implementation skeleton"
+    must_include:
+      structs:
+        - OHCI_registers
+        - ED
+        - TD
+        - HCCA
+      components:
+        - main_controller_loop
+        - libusb_abstraction_layer
+      separation:
+        - emulation_logic
+        - host_backend
+
+  - id: "PERFORMANCE"
+    description: "Optimize execution"
+    must_include:
+      - minimize_libusb_calls
+      - batching
+      - reduce_sync_overhead
+
+  - id: "OPTIONAL_FEATURES"
+    description: "Additional improvements"
+    optional: true
+    includes:
+      - debug_logging
+      - usb_tracing
+      - deterministic_replay
+
+output_rules:
+  structure: "strict_section_matching"
+  include:
+    - pseudocode
+    - partial_code
+  exclude:
+    - redundant_explanations
+    - prompt_restatement
+    - simplifications
+  priority:
+    - correctness
+    - completeness

@@ -1,0 +1,59 @@
+[submodule "Deps/ThirdParty/SDL3"]
+	path = Deps/ThirdParty/SDL3
+	url = https://github.com/libsdl-org/SDL.git
+	shallow = true
+[submodule "Deps/ThirdParty/toml11"]
+	path = Deps/ThirdParty/toml11
+	url = https://github.com/ToruNiina/toml11.git
+	shallow = true
+[submodule "Deps/ThirdParty/fmt"]
+	path = Deps/ThirdParty/fmt
+	url = https://github.com/fmtlib/fmt.git
+	shallow = true
+[submodule "Deps/ThirdParty/ImGui"]
+	path = Deps/ThirdParty/ImGui
+	url = https://github.com/ocornut/imgui.git
+	shallow = true
+	branch = docking
+[submodule "Deps/ThirdParty/microprofile"]
+	path = Deps/ThirdParty/microprofile
+	url = https://github.com/jonasmr/microprofile.git
+	shallow = true
+	ignore = dirty
+[submodule "Deps/ThirdParty/Sirit"]
+	path = Deps/ThirdParty/Sirit
+	url = https://github.com/shadps4-emu/sirit.git
+	shallow = true
+[submodule "Deps/ThirdParty/asmjit"]
+	path = Deps/ThirdParty/asmjit
+	url = https://github.com/asmjit/asmjit.git
+	shallow = true
+[submodule "Deps/ThirdParty/cryptopp"]
+	path = Deps/ThirdParty/cryptopp
+	url = https://github.com/weidai11/cryptopp.git
+	shallow = true
+[submodule "Deps/ThirdParty/volk"]
+	path = Deps/ThirdParty/volk
+	url = https://github.com/zeux/volk.git
+[submodule "Deps/ThirdParty/Vulkan-Headers"]
+	path = Deps/ThirdParty/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "Deps/ThirdParty/VulkanMemoryAllocator"]
+	path = Deps/ThirdParty/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "Deps/ThirdParty/vk-bootstrap"]
+	path = Deps/ThirdParty/vk-bootstrap
+	url = https://github.com/charles-lunarg/vk-bootstrap.git
+[submodule "Deps/ThirdParty/glslang"]
+	path = Deps/ThirdParty/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+[submodule "Deps/ThirdParty/plusaes"]
+	path = Deps/ThirdParty/plusaes
+	url = https://github.com/kkAyataka/plusaes.git
+[submodule "Deps/ThirdParty/FFmpeg"]
+	path = Deps/ThirdParty/FFmpeg
+	url = https://github.com/xenia-project/FFmpeg.git
+	shallow = true
+[submodule "Deps/ThirdParty/libusb"]
+	path = Deps/ThirdParty/libusb
+	url = https://github.com/libusb/libusb.git

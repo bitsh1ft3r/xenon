@@ -1,0 +1,772 @@
+diff --git a/Xenon/Core/XCPU/JIT/Backend/X86Backend/x86CodeGenBackend.cpp b/Xenon/Core/XCPU/JIT/Backend/X86Backend/x86CodeGenBackend.cpp
+index d9b26c5..52e36c6 100644
+--- a/Xenon/Core/XCPU/JIT/Backend/X86Backend/x86CodeGenBackend.cpp
++++ b/Xenon/Core/XCPU/JIT/Backend/X86Backend/x86CodeGenBackend.cpp
+@@ -190,25 +190,595 @@ namespace Xe {
+         // Barrier for optimization passes, no code emitted.
+       }
+ 
++      REGISTER_EMITTER(OPCODE_SYSCALL, Emit_SYSCALL)
++      static void Emit_SYSCALL(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        x86::Gp exReg = newGP16();
++        COMP->mov(exReg, EXPtr());
++        COMP->or_(exReg, imm<u16>(ppuSystemCallEx));
++        COMP->mov(EXPtr(), exReg);
++        COMP->mov(b->GetThreadContext()->scalar(&sPPUThread::exHVSysCall).Ptr(), imm<bool>(instr->currentInstrData.lev & 1));
++      }
++
++      REGISTER_EMITTER(OPCODE_RFID, Emit_RFID)
++      static void Emit_RFID(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        x86::Gp srr1 = newGP64();
++        x86::Gp msr = newGP64();
++        x86::Gp tmp = newGP64();
++
++        Label skipHVMESet = COMP->newLabel();
++        Label use64 = COMP->newLabel();
++
++        // MSR[1-2,4-32,37-41,49-50,52-57,60-63] <- SRR1[1-2,4-32,37-41,49-50,52-57,60-63]
++        COMP->mov(srr1, SPRPtr(SRR1));
++        COMP->mov(msr, srr1);
++
++        // MSR[0] <- SRR1[0] | SRR1[1]
++
++        Label setMSRSF = COMP->newLabel();
++        Label doneMSRSF = COMP->newLabel();
++
++        COMP->bt(srr1, 63); // SRR1[0]
++        COMP->jc(setMSRSF);
++        COMP->bt(srr1, 62); // SRR1[1]
++        COMP->jc(setMSRSF);
++        // SRR1[0] || SRR1[1] == 0
++        COMP->btr(msr, 63);
++        COMP->jmp(doneMSRSF);
++        COMP->bind(setMSRSF);
++        COMP->bts(msr, 63);
++        // Check was done and MSR was set.
++        COMP->bind(doneMSRSF);
++
++        // MSR[58] = SRR1[58] | SRR1[49]
++
++        Label setMSRIR = COMP->newLabel();
++        Label doneMSRIR = COMP->newLabel();
++
++        COMP->bt(srr1, 5); // SRR1[58]
++        COMP->jc(setMSRIR);
++        COMP->bt(srr1, 14); // SRR1[49]
++        COMP->jc(setMSRIR);
++        // SRR1[58] || SRR1[49] == 0
++        COMP->btr(msr, 5);
++        COMP->jmp(doneMSRIR);
++        COMP->bind(setMSRIR);
++        COMP->bts(msr, 5);
++        // Check was done and MSR was set.
++        COMP->bind(doneMSRIR);
++
++        // MSR[59] = SRR1[59] | SRR1[49]
++
++        Label setMSRDR = COMP->newLabel();
++        Label doneMSRDR = COMP->newLabel();
++
++        COMP->bt(srr1, 4); // SRR1[59]
++        COMP->jc(setMSRDR);
++        COMP->bt(srr1, 14); // SRR1[49]
++        COMP->jc(setMSRDR);
++        // SRR1[58] || SRR1[49] == 0
++        COMP->btr(msr, 4);
++        COMP->jmp(doneMSRDR);
++        COMP->bind(setMSRDR);
++        COMP->bts(msr, 4);
++        // Check was done and MSR was set.
++        COMP->bind(doneMSRDR);
++
++        // Check for HV bit in current MSR to skip setting HV and ME bits
++        x86::Gp currentMSR = newGP64();
++        COMP->mov(currentMSR, SPRPtr(MSR));
++        COMP->bt(currentMSR, 60); // MSR.HV
++        COMP->jnc(skipHVMESet);   // Jump if not in HV mode.
++
++        Label skipMSRSF = COMP->newLabel();
++        Label skipMSRME = COMP->newLabel();
++
++        // Set MSR[HV]
++        COMP->bt(srr1, 60); // SRR1[3]
++        COMP->jnc(skipMSRSF);
++        COMP->bts(msr, 60);
++        COMP->bind(skipMSRSF);
++        // Set MSR[ME]
++        COMP->bt(srr1, 12); // SRR1[51]
++        COMP->jnc(skipMSRME);
++        COMP->bts(msr, 12);
++        COMP->bind(skipMSRME);
++
++        // Skip setting HV and ME bits if not in HV mode
++        COMP->bind(skipHVMESet);
++        // Store composed MSR
++        COMP->mov(SPRPtr(MSR), msr);
++
++        // NIA <- SRR0 & ~3
++        x86::Gp srr0 = newGP64();
++        x86::Gp nia = newGP64();
++        COMP->mov(srr0, SPRPtr(SRR0));
++        COMP->mov(nia, srr0);
++        COMP->and_(nia, imm<u64>(~3ULL));
++        COMP->mov(NIAPtr(), nia);
++
++        // If MSR.SF == 0 (32-bit mode), truncate NIA to 32 bits
++        COMP->bt(msr, 63);  // MSR.SF
++        COMP->jc(use64);    // if set -> 64-bit mode, skip truncation
++        COMP->and_(nia, imm<u32>(0xFFFFFFFF));
++        COMP->mov(NIAPtr(), nia);
++
++        COMP->bind(use64);
++
++        // Clear exception taken flag.
++        COMP->mov(tmp.r8(), b->GetThreadContext()->scalar(&sPPUThread::interruptTaken));
++        COMP->and_(tmp, 0);
++        COMP->mov(b->GetThreadContext()->scalar(&sPPUThread::interruptTaken), tmp.r8());
++      }
++
++      REGISTER_EMITTER(OPCODE_MTMSRD, Emit_MTMSRD)
++      static void Emit_MTMSRD(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        // Source
++        x86::Gp rsValue = LoadValueGp(b, instr->src1.value);
++        // Get MSR
++        x86::Gp msrValue = newGP64();
++        COMP->mov(msrValue, SPRPtr(MSR));
++
++        if (instr->currentInstrData.l15) {
++          /*
++             Bits 48 and 62 of register RS are placed into the corresponding bits
++             of the MSR. The remaining bits of the MSR are unchanged
++          */
++
++          Label skipMSREE = COMP->newLabel();
++          Label skipMSRRI = COMP->newLabel();
++
++          // Bit 48 = MSR[EE]
++
++          // Clear MSR
++          COMP->btr(msrValue, imm(63 - 48));  // 48
++          // Check if rS has the bit set
++          COMP->bt(rsValue, imm(63 - 48));    // 48
++          // Jump otherwise
++          COMP->jnc(skipMSREE);
++          // Set the MSR bit
++          COMP->bts(msrValue, imm(63 - 48));
++          COMP->bind(skipMSREE);
++
++
++          // Bit 62 = MSR[RI]
++          COMP->btr(msrValue, imm(63 - 62));  // 62
++          COMP->bt(rsValue, imm(63 - 62));    // 62
++          COMP->jnc(skipMSRRI);
++          COMP->bts(msrValue, imm(63 - 62));
++          COMP->bind(skipMSRRI);
++
++          // Store back MSR
++          COMP->mov(SPRPtr(MSR), msrValue);
++        } else {
++          /*
++             The result of ORing bits 00 and 01 of register RS is placed into MSR0
++             The result of ORing bits 48 and 49 of register RS is placed into MSR48
++             The result of ORing bits 58 and 49 of register RS is placed into MSR58
++             The result of ORing bits 59 and 49 of register RS is placed into MSR59
++             Bits 1:2, 4:47, 49:50, 52:57, and 60:63 of register RS are placed into
++             the corresponding bits of the MSR
++          */
++
++          // MSR = rS
++          COMP->mov(msrValue, rsValue);
++
++          // MSR0 = (RS)0 | (RS)1
++
++          Label setMSRSF = COMP->newLabel();
++          Label doneMSRSF = COMP->newLabel();
++
++          COMP->bt(rsValue, imm(63 - 0));
++          COMP->jc(setMSRSF);
++          COMP->bt(rsValue, imm(63 - 1));
++          COMP->jc(setMSRSF);
++          COMP->btr(msrValue, imm(63 - 0));
++          COMP->jmp(doneMSRSF);
++          COMP->bind(setMSRSF);
++          COMP->bts(msrValue, imm(63 - 0));
++          // Check was done and MSR was set.
++          COMP->bind(doneMSRSF);
++
++          // MSR48 = (RS)48 | (RS)49
++
++          Label setMSREE = COMP->newLabel();
++          Label doneMSREE = COMP->newLabel();
++
++          COMP->bt(rsValue, imm(63 - 48));
++          COMP->jc(setMSREE);
++          COMP->bt(rsValue, imm(63 - 49));
++          COMP->jc(setMSREE);
++          COMP->btr(msrValue, imm(63 - 48));
++          COMP->jmp(doneMSREE);
++          COMP->bind(setMSREE);
++          COMP->bts(msrValue, imm(63 - 48));
++          // Check was done and MSR was set.
++          COMP->bind(doneMSREE);
++
++          // MSR58 = (RS)58 | (RS)49
++
++          Label setMSRIR = COMP->newLabel();
++          Label doneMSRIR = COMP->newLabel();
++
++          COMP->bt(rsValue, imm(63 - 58));
++          COMP->jc(setMSRIR);
++          COMP->bt(rsValue, imm(63 - 49));
++          COMP->jc(setMSRIR);
++          COMP->btr(msrValue, imm(63 - 58));
++          COMP->jmp(doneMSRIR);
++          COMP->bind(setMSRIR);
++          COMP->bts(msrValue, imm(63 - 58));
++          // Check was done and MSR was set.
++          COMP->bind(doneMSRIR);
++
++          // MSR59 = (RS)59 | (RS)49
++
++          Label setMSRDR = COMP->newLabel();
++          Label doneMSRDR = COMP->newLabel();
++
++          COMP->bt(rsValue, imm(63 - 59));
++          COMP->jc(setMSRDR);
++          COMP->bt(rsValue, imm(63 - 49));
++          COMP->jc(setMSRDR);
++          COMP->btr(msrValue, imm(63 - 59));
++          COMP->jmp(doneMSRDR);
++          COMP->bind(setMSRDR);
++          COMP->bts(msrValue, imm(63 - 59));
++          // Check was done and MSR was set.
++          COMP->bind(doneMSRDR);
++
++          // Store back MSR
++          COMP->mov(SPRPtr(MSR), msrValue);
++        }    
++      }
++
++      static void checkExt(XenonContext* context, sPPEState *ppeState) {
++        auto &thread = curThread;
++
++        if (thread.SPR.MSR.EE) {
++          if (context->iic.hasPendingInterrupts(thread.SPR.PIR)) {
++            thread.exceptReg |= ppuExternalEx;
++          }
++        }
++      }
++
+       REGISTER_EMITTER(OPCODE_SYNC_EXCEPTION_CHECK, Emit_SYNC_EXCEPTION_CHECK)
+         static void Emit_SYNC_EXCEPTION_CHECK(x86CodeGenBackend *b, const HIR::Instr *instr) {
+         // Test for present exceptions and return if any is found.
+         Label skipRet = COMP->newLabel();
+         x86::Gp exceptReg = newGP16();
+         COMP->mov(exceptReg, EXPtr());
++        COMP->and_(exceptReg, imm(SyncExceptionMask));
++        // Test
+         COMP->test(exceptReg, exceptReg);
+         COMP->jz(skipRet);
+         COMP->ret();
+         COMP->bind(skipRet);
+       }
+ 
++      REGISTER_EMITTER(OPCODE_MEMORY_BARRIER, Emit_MEMORY_BARRIER)
++        static void Emit_MEMORY_BARRIER(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        COMP->mfence();
++      }
++
++      REGISTER_EMITTER(OPCODE_MFSPR, Emit_MFSPR)
++        static void Emit_MFSPR(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        u32 sprNum = instr->currentInstrData.spr;
++        sprNum = ((sprNum & 0x1F) << 5) | ((sprNum >> 5) & 0x1F);
++
++        x86::Gp rSValue = newGP64();
++
++        switch (static_cast<eXenonSPR>(sprNum)) {
++        case eXenonSPR::XER:
++          COMP->mov(rSValue, SPRPtr(XER));
++          break;
++        case eXenonSPR::LR:
++          COMP->mov(rSValue, SPRPtr(LR));
++          break;
++        case eXenonSPR::CTR:
++          COMP->mov(rSValue, SPRPtr(CTR));
++          break;
++        case eXenonSPR::DSISR:
++          COMP->mov(rSValue, SPRPtr(DSISR));
++          break;
++        case eXenonSPR::DAR:
++          COMP->mov(rSValue, SPRPtr(DAR));
++          break;
++        case eXenonSPR::DEC:
++          COMP->mov(rSValue, SPRPtr(DEC));
++          break;
++        case eXenonSPR::SDR1:
++          COMP->mov(rSValue, SharedSPRPtr(SDR1));
++          break;
++        case eXenonSPR::SRR0:
++          COMP->mov(rSValue, SPRPtr(SRR0));
++          break;
++        case eXenonSPR::SRR1:
++          COMP->mov(rSValue, SPRPtr(SRR1));
++          break;
++        case eXenonSPR::CFAR:
++          COMP->mov(rSValue, SPRPtr(CFAR));
++          break;
++        case eXenonSPR::CTRLRD:
++          COMP->mov(rSValue, SharedSPRPtr(CTRL));
++          break;
++        case eXenonSPR::VRSAVE:
++          COMP->mov(rSValue, SPRPtr(VRSAVE));
++          break;
++        case eXenonSPR::TBLRO:
++          COMP->mov(rSValue, 0x00000000FFFFFFFF);
++          COMP->and_(rSValue, SharedSPRPtr(TB));
++          break;
++        case eXenonSPR::TBURO:
++          COMP->mov(rSValue, 0xFFFFFFFF00000000);
++          COMP->and_(rSValue, SharedSPRPtr(TB));
++          break;
++        case eXenonSPR::SPRG0:
++          COMP->mov(rSValue, SPRPtr(SPRG0));
++          break;
++        case eXenonSPR::SPRG1:
++          COMP->mov(rSValue, SPRPtr(SPRG1));
++          break;
++        case eXenonSPR::SPRG2:
++          COMP->mov(rSValue, SPRPtr(SPRG2));
++          break;
++        case eXenonSPR::SPRG3:
++          COMP->mov(rSValue, SPRPtr(SPRG3));
++          break;
++        case eXenonSPR::PVR:
++          COMP->mov(rSValue, SharedSPRPtr(PVR));
++          break;
++        case eXenonSPR::HSPRG0:
++          COMP->mov(rSValue, SPRPtr(HSPRG0));
++          break;
++        case eXenonSPR::HSPRG1:
++          COMP->mov(rSValue, SPRPtr(HSPRG1));
++          break;
++        case eXenonSPR::RMOR:
++          COMP->mov(rSValue, SharedSPRPtr(RMOR));
++          break;
++        case eXenonSPR::HRMOR:
++          COMP->mov(rSValue, SharedSPRPtr(HRMOR));
++          break;
++        case eXenonSPR::LPCR:
++          COMP->mov(rSValue, SharedSPRPtr(LPCR));
++          break;
++        case eXenonSPR::TSCR:
++          COMP->mov(rSValue, SharedSPRPtr(TSCR));
++          break;
++        case eXenonSPR::TTR:
++          COMP->mov(rSValue, SharedSPRPtr(TTR));
++          break;
++        case eXenonSPR::PPE_TLB_Index_Hint:
++          COMP->mov(rSValue, SPRPtr(PPE_TLB_Index_Hint));
++          break;
++        case eXenonSPR::HID0:
++          COMP->mov(rSValue, SharedSPRPtr(HID0));
++          break;
++        case eXenonSPR::HID1:
++          COMP->mov(rSValue, SharedSPRPtr(HID1));
++          break;
++        case eXenonSPR::HID4:
++          COMP->mov(rSValue, SharedSPRPtr(HID4));
++          break;
++        case eXenonSPR::DABR:
++          COMP->mov(rSValue, SPRPtr(DABR));
++          break;
++        case eXenonSPR::HID6:
++          COMP->mov(rSValue, SharedSPRPtr(HID6));
++          break;
++        case eXenonSPR::PIR:
++          COMP->mov(rSValue, SPRPtr(PIR));
++          break;
++        case eXenonSPR::SPR_DBG_1014:
++          COMP->mov(rSValue, SPRPtr(SPR_DBG_1014));
++          break;
++        case eXenonSPR::SPR_DBG_1018:
++          COMP->mov(rSValue, SPRPtr(SPR_DBG_1018));
++          break;
++        default:
++          LOG_ERROR(Xenon, "(Thrd{:#d} mfspr: Unknown SPR: {:#x}", static_cast<u8>(curThreadId), sprNum);
++          break;
++        }
++
++        
++        TagStoreReg(instr->dest, rSValue);
++      }
++
++
++      void JITHelper_MTCTRLWR(sPPEState *ppeState) {
++        uCTRL newCTRL;
++        newCTRL.hexValue = static_cast<u32>(GPRi(rd));
++        if (curThreadId == ePPUThread_Zero) {
++          // Thread Zero
++          if (ppeState->SPR.CTRL.TE1) {
++            // TE1 is set, do not modify it.
++            newCTRL.TE1 = 1;
++          }
++        } else {
++          // Thread One
++          if (ppeState->SPR.CTRL.TE0) {
++            // TE0 is set, do not modify it.
++            newCTRL.TE0 = 1;
++          }
++        }
++
++        // TODO: Check this, reversing and docs suggests this is the correct behavior.
++        // If a thread is being enabled, we must generate a reset interrupt on said thread.
++        if (ppeState->SPR.CTRL.TE0 == 0 && newCTRL.TE0) { ppeState->ppuThread[0].exceptReg |= ppuSystemResetEx; }
++        if (ppeState->SPR.CTRL.TE1 == 0 && newCTRL.TE1) { ppeState->ppuThread[1].exceptReg |= ppuSystemResetEx; }
++
++        LOG_TRACE(Xenon, "{} (Thread{:#d}): Setting ctrl to {:#x}", ppeState->ppuName, (u8)curThreadId, newCTRL.hexValue);
++
++        ppeState->SPR.CTRL = newCTRL;
++      }
++
++      REGISTER_EMITTER(OPCODE_MTSPR, Emit_MTSPR)
++        static void Emit_MTSPR(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        u32 sprNum = instr->currentInstrData.spr;
++        sprNum = ((sprNum & 0x1F) << 5) | ((sprNum >> 5) & 0x1F);
++
++        x86::Gp rSValue = LoadValueGp(b, instr->src1.value);
++
++        switch (static_cast<eXenonSPR>(sprNum)) {
++        case eXenonSPR::XER:
++          // Clear the unused bits in XER (35:56)
++          COMP->and_(rSValue, imm(0xE000007F));
++          COMP->mov(SPRPtr(XER), rSValue);
++          break;
++        case eXenonSPR::LR:
++          COMP->mov(SPRPtr(LR), rSValue);
++          break;
++        case eXenonSPR::CTR:
++          COMP->mov(SPRPtr(CTR), rSValue);
++          break;
++        case eXenonSPR::DSISR:
++          COMP->mov(SPRPtr(DSISR), rSValue);
++          break;
++        case eXenonSPR::DAR:
++          COMP->mov(SPRPtr(DAR), rSValue);
++          break;
++        case eXenonSPR::DEC:
++          COMP->mov(SPRPtr(DEC), rSValue.r32());
++          break;
++        case eXenonSPR::SDR1:
++          COMP->mov(SharedSPRPtr(SDR1), rSValue);
++          break;
++        case eXenonSPR::SRR0:
++          COMP->mov(SPRPtr(SRR0), rSValue);
++          break;
++        case eXenonSPR::SRR1:
++          COMP->mov(SPRPtr(SRR1), rSValue);
++          break;
++        case eXenonSPR::CFAR:
++          COMP->mov(SPRPtr(CFAR), rSValue);
++          break;
++        case eXenonSPR::CTRLWR: {
++          // Invoke a helper to do the CTRL reg setting.
++          InvokeNode *ctrlwrInv = nullptr;
++          COMP->invoke(&ctrlwrInv, imm((void *)JITHelper_MTCTRLWR), FuncSignature::build<void, sPPEState *>());
++          ctrlwrInv->setArg(0, b->ppeState->Base());
++        } break;
++        case eXenonSPR::VRSAVE:
++          COMP->mov(SPRPtr(VRSAVE), rSValue);
++          break;      
++        case eXenonSPR::SPRG0:
++          COMP->mov(SPRPtr(SPRG0), rSValue);
++          break;
++        case eXenonSPR::SPRG1:
++          COMP->mov(SPRPtr(SPRG1), rSValue);
++          break;
++        case eXenonSPR::SPRG2:
++          COMP->mov(SPRPtr(SPRG2), rSValue);
++          break;
++        case eXenonSPR::SPRG3:
++          COMP->mov(SPRPtr(SPRG3), rSValue);
++          break;
++        case eXenonSPR::TBLWO: {
++          // TODO: Properly fix this
++          x86::Gp tmp = newGP64();
++          //COMP->mov(tmp, SharedSPRPtr(TB));
++          //COMP->and_(rSValue, imm(0x00000000FFFFFFFF));
++          //COMP->and_(tmp, imm(0xFFFFFFFF00000000));
++          //COMP->or_(rSValue, tmp);
++          COMP->mov(SharedSPRPtr(TB), rSValue);
++        } break;
++        case eXenonSPR::TBUWO: {
++          // TODO: Properly fix this
++          x86::Gp tmp = newGP64();
++          //COMP->mov(tmp, SharedSPRPtr(TB));
++          //COMP->and_(rSValue, imm(0x00000000FFFFFFFF));
++          //COMP->shl(rSValue, 32);
++          //COMP->and_(tmp, imm(0x00000000FFFFFFFF));
++          //COMP->or_(rSValue, tmp);
++          COMP->mov(SharedSPRPtr(TB), rSValue);
++        } break;
++        case eXenonSPR::HSPRG0:
++          COMP->mov(SPRPtr(HSPRG0), rSValue);
++          break;
++        case eXenonSPR::HSPRG1:
++          COMP->mov(SPRPtr(HSPRG1), rSValue);
++          break;
++        case eXenonSPR::HDEC:
++          COMP->mov(SharedSPRPtr(HDEC), rSValue.r32());
++          break;
++        case eXenonSPR::RMOR:
++          COMP->mov(SharedSPRPtr(RMOR), rSValue);
++          break;
++        case eXenonSPR::HRMOR:
++          COMP->mov(SharedSPRPtr(HRMOR), rSValue);
++          break;
++        case eXenonSPR::LPCR:
++          COMP->mov(SharedSPRPtr(LPCR), rSValue);
++          break;
++        case eXenonSPR::LPIDR:
++          COMP->mov(SharedSPRPtr(LPIDR), rSValue.r32());
++          break;
++        case eXenonSPR::TSCR:
++          COMP->mov(SharedSPRPtr(TSCR), rSValue.r32());
++          break;
++        case eXenonSPR::TTR:
++          COMP->mov(SharedSPRPtr(TTR), rSValue);
++          break;
++        case eXenonSPR::PPE_TLB_Index:
++          COMP->mov(SharedSPRPtr(PPE_TLB_Index), rSValue);
++          break;
++        case eXenonSPR::PPE_TLB_Index_Hint:
++          COMP->mov(SPRPtr(PPE_TLB_Index_Hint), rSValue);
++          break;
++        case eXenonSPR::PPE_TLB_VPN: {
++          COMP->mov(SharedSPRPtr(PPE_TLB_VPN), rSValue);
++          // Add new tlb entry via function call
++          InvokeNode *addTLBEntryInv = nullptr;
++          COMP->invoke(&addTLBEntryInv, imm((void *)PPCInterpreter::mmuAddTlbEntry), FuncSignature::build<void, sPPEState *>());
++          addTLBEntryInv->setArg(0, b->ppeState->Base());
++        } break;
++        case eXenonSPR::PPE_TLB_RPN:
++          COMP->mov(SharedSPRPtr(PPE_TLB_RPN), rSValue);
++          break;
++        case eXenonSPR::HID0:
++          COMP->mov(SharedSPRPtr(HID0), rSValue);
++          break;
++        case eXenonSPR::HID1:
++          COMP->mov(SharedSPRPtr(HID1), rSValue);
++          break;
++        case eXenonSPR::HID4:
++          COMP->mov(SharedSPRPtr(HID4), rSValue);
++          break;
++        case eXenonSPR::HID6:
++          COMP->mov(SharedSPRPtr(HID6), rSValue);
++          break;
++        case eXenonSPR::DABR:
++          COMP->mov(SPRPtr(DABR), rSValue);
++          break;
++        case eXenonSPR::DABRX:
++          COMP->mov(SPRPtr(DABRX), rSValue);
++          break;
++        case eXenonSPR::SPR_DBG_1014:
++          COMP->mov(SPRPtr(SPR_DBG_1014), rSValue);
++          break;
++        case eXenonSPR::SPR_DBG_1018:
++          COMP->mov(SPRPtr(SPR_DBG_1018), rSValue);
++          break;
++        default:
++          LOG_ERROR(Xenon, "(Thrd{:#d} mfspr: Unknown SPR: {:#x}", static_cast<u8>(curThreadId), sprNum);
++          break;
++        }
++      }
++
++      REGISTER_EMITTER(OPCODE_CALL_HLE_FUNCTION, Emit_CALL_HLE_FUNCTION)
++        static void Emit_CALL_HLE_FUNCTION(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        void *fnPtr = reinterpret_cast<void *>(instr->src1.offset);
++        InvokeNode *hleInv = nullptr;
++        COMP->invoke(&hleInv, imm(fnPtr), FuncSignature::build<int, void *>());
++        hleInv->setArg(0, b->ppeState->Base());
++      }
++
+       //
+       // Call Interpreter (system instruction fallback)
+       //
+ 
+       // Stores the raw PPC instruction into sPPUThread::CI, then invokes
+       // the interpreter function with sPPEState* as its argument.
+-      // sig: X_O  (no dest, src1 = interpreter function pointer)
+       REGISTER_EMITTER(OPCODE_CALL_INTERPRETER, Emit_CALL_INTERPRETER)
+       static void Emit_CALL_INTERPRETER(x86CodeGenBackend *b, const HIR::Instr *instr) {
+         // 1. Store the raw instruction data into sPPUThread::CI
+@@ -273,7 +843,6 @@ namespace Xe {
+ 
+       REGISTER_EMITTER(OPCODE_LOAD_CONTEXT, Emit_LOAD_CONTEXT)
+       static void Emit_LOAD_CONTEXT(x86CodeGenBackend *b, const HIR::Instr *instr) {
+-        // sig: V_O  (dest = value, src1 = offset)
+         u64 offset = instr->src1.offset;
+         auto *comp = b->GetCompiler();
+         auto *ctx = b->GetThreadContext();
+@@ -327,7 +896,6 @@ namespace Xe {
+ 
+       REGISTER_EMITTER(OPCODE_STORE_CONTEXT, Emit_STORE_CONTEXT)
+       static void Emit_STORE_CONTEXT(x86CodeGenBackend *b, const HIR::Instr *instr) {
+-        // sig: X_O_V  (no dest, src1 = offset, src2 = value)
+         u64 offset = instr->src1.offset;
+         HIR::Value *val = instr->src2.value;
+         auto *comp = b->GetCompiler();
+@@ -353,6 +921,15 @@ namespace Xe {
+             comp->mov(tmp, asmjit::Imm(val->constant.i64));
+             comp->mov(field.Ptr<u64>(), tmp);
+           } break;
++          case HIR::VEC128_TYPE: {
++            // Store each 32-bit dword of the 128-bit vector constant individually.
++            asmjit::x86::Gp tmp = comp->newGpd();
++            for (u32 i = 0; i < 4; i++) {
++              ASMJitPtr<u8> dwordField(ctx->Base(), ctx->Offset() + offset + i * sizeof(u32));
++              comp->mov(tmp, asmjit::Imm(val->constant.v128.dsword[i]));
++              comp->mov(dwordField.Ptr<u32>(), tmp);
++            }
++          } break;
+           default:
+             LOG_WARNING(Xenon, "[x86Backend]: STORE_CONTEXT constant type {} not yet handled",
+               static_cast<int>(val->type));
+@@ -398,6 +975,14 @@ namespace Xe {
+         }
+       }
+ 
++      REGISTER_EMITTER(OPCODE_LOAD_TIME_BASE, Emit_LOAD_TIME_BASE)
++        static void Emit_LOAD_TIME_BASE(x86CodeGenBackend *b, const HIR::Instr *instr) {
++        // Loads time base register
++        x86::Gp timeBase = newGP64();
++        COMP->mov(timeBase, SharedSPRPtr(TB));
++        TagStoreReg(instr->dest, timeBase);
++      }
++
+       // 
+       // x86CodeGenBackend implementation
+       //
+@@ -455,11 +1040,14 @@ namespace Xe {
+ 
+       // Emit code for a full HIR block.
+       bool x86CodeGenBackend::EmitBlock(HIR::HIRBlock *block, void **outCode, u64 *outCodeSize,
+-                                        ePPUThreadID threadId) {
++                                        ePPUThreadID threadId, void ***outChainSlot,
++                                        void ***outChainSlotFall) {
+         if (!block || !outCode || !outCodeSize) return false;
+ 
+         *outCode = nullptr;
+         *outCodeSize = 0;
++        if (outChainSlot) *outChainSlot = nullptr;
++        if (outChainSlotFall) *outChainSlotFall = nullptr;
+ 
+         // Set up asmjit code holder for this block.
+         codeHolder.reset();
+@@ -519,6 +1107,81 @@ namespace Xe {
+           EmitInstruction(instr);
+         }
+ 
++        // Block linking tail.
++        // When the HIR translator proved the block ends with a branch to a
++        // translate-time-constant guest address, allocate one `void *` slot
++        // per chainable successor and emit a tail of the form:
++        //   if (--thread.jitChainBudget < 0)        skip   // bound recursion
++        //   load nia from thread context
++        //   if (nia == takenConst && (t = *takenSlot)) call(t); skip
++        //   if (nia == fallConst  && (t = *fallSlot )) call(t); skip
++        //   skip: ret
++        // The dispatcher patches each slot to the destination block's host
++        // code pointer once that block is compiled, so the chain tail becomes
++        // a direct call into the next block (skipping the dispatcher hashmap).
++        // Note: this is a regular call+ret, NOT a true tail jump, so each
++        // chain hop adds one host stack frame. The chain budget caps the
++        // depth so cycles like B->C->B are bounded.
++        void **chainSlot = nullptr;
++        void **chainSlotFall = nullptr;
++        const bool hasTaken = outChainSlot && block->chainTargetGuestAddr != HIR::INVALID_CHAIN_TARGET;
++        const bool hasFall = outChainSlotFall && block->chainTargetGuestAddrFall != HIR::INVALID_CHAIN_TARGET;
++        if (hasTaken || hasFall) {
++          if (hasTaken) chainSlot = new void *(nullptr);
++          if (hasFall) chainSlotFall = new void *(nullptr);
++
++          asmjit::Label skipChain = comp.newLabel();
++          asmjit::Label doInvoke = comp.newLabel();
++
++          // 1. Budget gate: if the per-thread chain counter has reached zero,
++          //    return to the dispatcher instead of recursing further.
++          asmjit::x86::Gp budgetReg = comp.newGpd("chain_budget");
++          asmjit::x86::Mem budgetMem = ctxPtr.scalar(&sPPUThread::jitChainBudget);
++          comp.mov(budgetReg, budgetMem);
++          comp.test(budgetReg, budgetReg);
++          comp.jz(skipChain);
++          comp.dec(budgetReg);
++          comp.mov(budgetMem, budgetReg);
++
++          // 2. Load the resolved NIA. The branch lowering wrote it to memory
++          //    via Select(cond, taken, fallthrough) before this tail runs.
++          asmjit::x86::Gp niaReg = comp.newGpz("chain_nia");
++          comp.mov(niaReg, ctxPtr.scalar(&sPPUThread::NIA));
++
++          asmjit::x86::Gp constReg = comp.newGpz("chain_const");
++          asmjit::x86::Gp slotPtrReg = comp.newGpz("chain_slot_ptr");
++          asmjit::x86::Gp targetReg = comp.newGpz("chain_target");
++
++          auto emitCheck = [&](u64 targetGuestAddr, void **slot) {
++            asmjit::Label nextCheck = comp.newLabel();
++            comp.mov(constReg, asmjit::imm(targetGuestAddr));
++            comp.cmp(niaReg, constReg);
++            comp.jne(nextCheck);
++            comp.mov(slotPtrReg, asmjit::imm((void *)slot));
++            comp.mov(targetReg, asmjit::x86::ptr(slotPtrReg));
++            comp.test(targetReg, targetReg);
++            comp.jz(skipChain);
++            comp.jmp(doInvoke);
++            comp.bind(nextCheck);
++          };
++
++          if (hasTaken) emitCheck(block->chainTargetGuestAddr, chainSlot);
++          if (hasFall)  emitCheck(block->chainTargetGuestAddrFall, chainSlotFall);
++
++          // No successor matched the resolved NIA — fall back to dispatcher.
++          comp.jmp(skipChain);
++
++          comp.bind(doInvoke);
++          asmjit::InvokeNode *chainCall = nullptr;
++          comp.invoke(&chainCall, targetReg,
++            asmjit::FuncSignature::build<void, PPU *, sPPEState *, bool>());
++          chainCall->setArg(0, ppuArg);
++          chainCall->setArg(1, ppeBase);
++          chainCall->setArg(2, haltArg);
++
++          comp.bind(skipChain);
++        }
++
+         // Epilogue.
+         comp.ret();
+         comp.endFunc();
+@@ -531,6 +1194,8 @@ namespace Xe {
+         if (err) {
+           LOG_ERROR(Xenon, "[x86Backend]: asmjit finalize error: {}", asmjit::DebugUtils::errorAsString(err));
+           DumpHIR(block);
++          delete chainSlot;
++          delete chainSlotFall;
+           return false;
+         }
+ 
+@@ -556,12 +1221,16 @@ namespace Xe {
+         }
+         if (err || !codePtr) {
+           LOG_ERROR(Xenon, "[x86Backend]: asmjit runtime add error: {}", asmjit::DebugUtils::errorAsString(err));
++          delete chainSlot;
++          delete chainSlotFall;
+           return false;
+         }
+ 
+         // Return generated code and code size
+         *outCode = codePtr;
+         *outCodeSize = codeHolder.codeSize();
++        if (outChainSlot) *outChainSlot = chainSlot;
++        if (outChainSlotFall) *outChainSlotFall = chainSlotFall;
+         return true;
+       }
+ 

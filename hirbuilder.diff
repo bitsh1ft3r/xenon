@@ -1,0 +1,454 @@
+diff --git a/Xenon/Core/XCPU/JIT/HIR/HIRBuilder.cpp b/Xenon/Core/XCPU/JIT/HIR/HIRBuilder.cpp
+index d4fd8bb..bbc39f3 100644
+--- a/Xenon/Core/XCPU/JIT/HIR/HIRBuilder.cpp
++++ b/Xenon/Core/XCPU/JIT/HIR/HIRBuilder.cpp
+@@ -59,6 +59,8 @@ namespace Xe {
+       void HIRBuilder::Reset() {
+         currentBlock = NULL;
+         nextValueOrdinal = 0;
++        currentInstructionAddress_ = 0;
++        msrSF_ = true;  // Default to 64-bit mode; translator overrides per block.
+ #if SCRIBBLE_ARENA_ON_RESET
+         arena_->DebugFill();
+ #endif
+@@ -78,6 +80,8 @@ namespace Xe {
+         block->arena = arena_;
+         currentBlock = block;
+         block->instr_head = block->instr_tail = NULL;
++        block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
++        block->chainTargetGuestAddrFall = INVALID_CHAIN_TARGET;
+         return block;
+       }
+ 
+@@ -265,25 +269,12 @@ namespace Xe {
+       }
+ 
+       void HIRBuilder::UpdateCR6(Value *value) {
+-        // value is a VEC128 result from a vector compare.
+-        // CR6 bits: [0]=all_true, [1]=0, [2]=none_true, [3]=0
+-        // Extract all 4 dwords and test them.
+-        Value *w0 = Extract(value, (u8)0, INT32_TYPE);
+-        Value *w1 = Extract(value, (u8)1, INT32_TYPE);
+-        Value *w2 = Extract(value, (u8)2, INT32_TYPE);
+-        Value *w3 = Extract(value, (u8)3, INT32_TYPE);
+-
+-        // all_true: all dwords are 0xFFFFFFFF
+-        Value *andAll = And(And(w0, w1), And(w2, w3));
+-        Value *allTrue = CompareEQ(andAll, LoadConstantUint32(0xFFFFFFFF));
+-
+-        // none_true: all dwords are 0x00000000
+-        Value *orAll = Or(Or(w0, w1), Or(w2, w3));
+-        Value *noneTrue = CompareEQ(orAll, LoadConstantUint32(0));
+-
+-        // Build 4-bit CR field value: (allTrue << 3) | (noneTrue << 1)
+-        Value *allBit = Shl(allTrue, (s8)3);
+-        Value *noneBit = Shl(noneTrue, (s8)1);
++        Value *allEqual = IsFalse(Not(value));
++        Value *noneEqual = IsFalse(value);
++
++        // Build 4-bit CR field value
++        Value *allBit = Shl(allEqual, (s8)3);
++        Value *noneBit = Shl(noneEqual, (s8)1);
+         Value *cr6Val = Or(allBit, noneBit);
+ 
+         // Set CR field 6
+@@ -293,6 +284,93 @@ namespace Xe {
+         j->src3.value = NULL;
+       }
+ 
++      void HIRBuilder::UpdateFPSCR(Value *value, bool updateCR1) {
++        // Classify the floating-point result and update FPSCR FPRF bits.
++        // FPRF is a 5-bit field at FPSCR bits 15-19 (C, FL, FG, FE, FU).
++        //
++        // For arithmetic results, FPCC (the lower 4 bits of FPRF) is set as:
++        //   FL (bit 3): result < 0  (negative)
++        //   FG (bit 2): result > 0  (positive)
++        //   FE (bit 1): result == 0 (zero)
++        //   FU (bit 0): result is NaN (unordered)
++        // And C (class bit) is set for denormals/infinities.
++        //
++        // We build FPCC using HIR comparisons against zero, then update the
++        // FPSCR field in-place.
++
++        Value *fpscr = LoadFPSCR();
++        Value *zero = LoadZeroFloat64();
++
++        // Check for NaN
++        Value *isNan = IsNan(value);
++
++        // Check comparisons (only valid when not NaN)
++        Value *notNan = Xor(isNan, LoadConstantInt8(0x01));
++        Value *isNeg = And(notNan, CompareSLT(value, zero));
++        Value *isPos = And(notNan, CompareSGT(value, zero));
++        Value *isZero = And(notNan, CompareEQ(value, zero));
++
++        // Build FPCC: FL=8, FG=4, FE=2, FU=1
++        Value *fpcc = LoadZeroInt8();
++        fpcc = Or(fpcc, Shl(isNeg, (s8)3));   // FL at bit 3
++        fpcc = Or(fpcc, Shl(isPos, (s8)2));   // FG at bit 2
++        fpcc = Or(fpcc, Shl(isZero, (s8)1));  // FE at bit 1
++        fpcc = Or(fpcc, isNan);                // FU at bit 0
++
++        // FPRF is at bits 15-19 in FPSCR (5-bit field).
++        // For now we only update FPCC (bits 16-19, the lower 4 bits of FPRF).
++        // C bit (bit 15) is left as 0 for basic classification.
++        // FPRF mask: bits 15-19 = 0x0001F000
++        // FPCC mask: bits 16-19 = 0x000F0000 ... 
++        // Actually in the PowerPC FPSCR layout used here (PPCBitfield<u32, 15, 5> FPRF):
++        // FPRF occupies bits [15..19] counting from MSB, which in a 32-bit LE value
++        // is at bit positions (31-15)=16 down to (31-19)=12.
++        // So FPCC (4 bits) is at bits 12-15 and C is at bit 16.
++        constexpr u32 FPCC_MASK = 0xFu << 12;   // bits 12-15
++        constexpr u32 FPCC_CLEAR = ~FPCC_MASK;
++
++        // Clear existing FPCC bits
++        Value *clearedFPSCR = And(fpscr, LoadConstantUint32(FPCC_CLEAR));
++
++        // Shift FPCC into position and merge
++        Value *fpcc32 = ZeroExtend(fpcc, INT32_TYPE);
++        Value *shiftedFPCC = Shl(fpcc32, LoadConstantInt8(12));
++        Value *newFPSCR = Or(clearedFPSCR, shiftedFPCC);
++        StoreFPSCR(newFPSCR);
++
++        // Optionally update CR1 from FPSCR
++        if (updateCR1) {
++          UpdateCR1();
++        }
++      }
++
++      void HIRBuilder::UpdateCR1() {
++        // CR1 <- FPSCR[FX] || FPSCR[FEX] || FPSCR[VX] || FPSCR[OX]
++        // FX  = bit 0 (BE) = bit 31 (LE value)
++        // FEX = bit 1 (BE) = bit 30
++        // VX  = bit 2 (BE) = bit 29
++        // OX  = bit 3 (BE) = bit 28
++        Value *fpscr = LoadFPSCR();
++
++        // Extract FX (bit 31), FEX (bit 30), VX (bit 29), OX (bit 28)
++        Value *fx  = And(Shr(fpscr, LoadConstantInt8(31)), LoadConstantUint32(1));
++        Value *fex = And(Shr(fpscr, LoadConstantInt8(30)), LoadConstantUint32(1));
++        Value *vx  = And(Shr(fpscr, LoadConstantInt8(29)), LoadConstantUint32(1));
++        Value *ox  = And(Shr(fpscr, LoadConstantInt8(28)), LoadConstantUint32(1));
++
++        // Build CR1 value: FX at bit 3, FEX at bit 2, VX at bit 1, OX at bit 0
++        Value *cr1 = Or(Shl(fx, LoadConstantInt8(3)),
++                     Or(Shl(fex, LoadConstantInt8(2)),
++                     Or(Shl(vx, LoadConstantInt8(1)), ox)));
++        Value *cr1_8 = Truncate(cr1, INT8_TYPE);
++
++        // Set CR field 1
++        Instr *j = AppendInstr(OPCODE_SET_CR_FIELD_info, 0);
++        j->src1.offset = static_cast<u64>(1);
++        j->set_src2(cr1_8);
++        j->src3.value = NULL;
++      }
++
+       void HIRBuilder::StoreSAT(Value *satFlag) {
+         // satFlag is INT8 (0 or 1) from DidSaturate().
+         // VSCR.SAT is bit 0 of VSCR.hexValue (u32). It's a sticky bit (OR).
+@@ -311,9 +389,12 @@ namespace Xe {
+ 
+       // Floating-Point Registers
+       Value *HIRBuilder::LoadFPR(u32 reg) {
+-        return LoadContext(offsetof(sPPUThread, FPR[reg]), INT64_TYPE);
++        return LoadContext(offsetof(sPPUThread, FPR[reg]), FLOAT64_TYPE);
+       }
+       void HIRBuilder::StoreFPR(u32 reg, Value *value) {
++        if (value->type != FLOAT64_TYPE) {
++          UNREACHABLE();
++        }
+         StoreContext(offsetof(sPPUThread, FPR[reg]), value);
+       }
+ 
+@@ -340,6 +421,11 @@ namespace Xe {
+       void HIRBuilder::StoreCTR(Value *value) {
+         StoreContext(offsetof(sPPUThread, SPR.CTR), value);
+       }
++      Value *HIRBuilder::DecAndStoreCTR() {
++        Value *newCTR = Sub(LoadCTR(), LoadConstantUint64(1));
++        StoreCTR(newCTR);
++        return newCTR;
++      }
+ 
+       // Fixed-Point Exception Register
+       Value *HIRBuilder::LoadXER() {
+@@ -414,34 +500,157 @@ namespace Xe {
+         return Truncate(cr, INT8_TYPE);
+       }
+ 
++      Value *HIRBuilder::LoadCRBit(u8 bi) {
++        // PPC numbers CR bits 0..31 with bit 0 at the MSB of the 32-bit CR_Hex.
++        // The corresponding LSB-relative position is (31 - bi).
++        Value *cr = LoadCR();
++        u8 sh = static_cast<u8>(31 - bi);
++        if (sh)
++          cr = Shr(cr, LoadConstantInt8(static_cast<s8>(sh)));
++        cr = And(cr, LoadConstantUint32(1));
++        return Truncate(cr, INT8_TYPE);
++      }
++
+       void HIRBuilder::StoreCR(Value *value) {
+         StoreContext(offsetof(sPPUThread, CR), value);
+       }
+ 
+       // Branch Control
++      //
++      // Branches are lowered at HIR build time into existing primitives
++      // (load_context / store_context / select / and / shr / sub) so that the
++      // optimizer can see and fold the BO/BI/CTR/CR logic. There are no
++      // dedicated branch opcodes in the HIR -- the block terminates because the
++      // PPC translator stops fetching after a branch instruction, and the
++      // backend's function epilogue (ret) ends the host function.
++
++      Value *HIRBuilder::ComputeBranchCondition(u32 bo, u32 bi, bool noCtrDec) {
++        // BO encoding (PPC bit numbering, mapped to LSB-first bit masks):
++        //   bo & 0x10 -> BO[0]: 1 = ignore CR test
++        //   bo & 0x08 -> BO[1]: expected CR bit value (only if BO[0]=0)
++        //   bo & 0x04 -> BO[2]: 1 = skip CTR decrement / test
++        //   bo & 0x02 -> BO[3]: 1 = take when CTR==0, 0 = take when CTR!=0 (only if BO[2]=0)
++        //   bo & 0x01 -> BO[4]: branch hint (ignored)
++
++        Value *ctrOk = nullptr;
++        if (!noCtrDec && (bo & 0x4) == 0) {
++          Value *newCTR = DecAndStoreCTR();
++          if (bo & 0x2) {
++            // Take when CTR == 0
++            ctrOk = IsFalse(newCTR);
++          } else {
++            // Take when CTR != 0
++            ctrOk = IsTrue(newCTR);
++          }
++        }
+ 
++        Value *crOk = nullptr;
++        if ((bo & 0x10) == 0) {
++          Value *bit = LoadCRBit(static_cast<u8>(bi));
++          if (bo & 0x8) {
++            crOk = bit;            // take when CR[bi] == 1
++          } else {
++            crOk = IsFalse(bit);   // take when CR[bi] == 0
++          }
++        }
++
++        if (!ctrOk && !crOk) return nullptr;  // truly unconditional
++        if (!ctrOk) return crOk;
++        if (!crOk) return ctrOk;
++        return And(ctrOk, crOk);
++      }
++
++      Value *HIRBuilder::MaybeTruncateNIAForMSR(Value *nia64) {
++        // MSR.SF is captured per-block at translate time and the cache key
++        // separates SF=0 / SF=1 compilations of the same address. The choice
++        // is therefore a translate-time constant: 64-bit mode passes the value
++        // through, 32-bit mode masks to the low 32 bits.
++        if (msrSF_) {
++          return nia64;
++        }
++        return And(nia64, LoadConstantUint64(0xFFFFFFFFULL));
++      }
++
++      void HIRBuilder::EmitBranchEpilogue(Value *targetIfTaken, Value *cond, bool link) {
++        // PPC ISA: when LK=1 the link register is written unconditionally with
++        // CIA+4, regardless of whether the branch is taken. The caller has
++        // already evaluated targetIfTaken using the *old* LR / CTR value, so
++        // it is safe to overwrite LR here.
++        if (link) {
++          StoreLR(LoadConstantUint64(currentInstructionAddress_ + 4));
++        }
++
++        // NIA: take target if cond is true (or always, if cond is null), else
++        // fall through to CIA+4.
++        Value *nia = targetIfTaken;
++        if (cond) {
++          Value *fallthrough = LoadConstantUint64(currentInstructionAddress_ + 4);
++          nia = Select(cond, targetIfTaken, fallthrough);
++        }
++        nia = MaybeTruncateNIAForMSR(nia);
++        StoreContext(offsetof(sPPUThread, NIA), nia);
++      }
++
++      // b / bl / ba / bla -- always taken, no BO/BI.
+       void HIRBuilder::Branch(uPPCInstr currentInstr) {
+-        Instr *i = AppendInstr(OPCODE_BRANCH_info, 0);
+-        i->src1.value = i->src2.value = i->src3.value = NULL;
+-        i->currentInstrData = currentInstr;
++        const s64 base = currentInstr.aa ? 0 : static_cast<s64>(currentInstructionAddress_);
++        const u64 rawTarget = static_cast<u64>(base + static_cast<s64>(currentInstr.bt24));
++        // Post-MSR-truncation address — what NIA will actually contain after the
++        // block runs, and therefore the dispatcher's lookup key.
++        const u64 effectiveTarget = msrSF_ ? rawTarget : (rawTarget & 0xFFFFFFFFULL);
++
++        EmitBranchEpilogue(LoadConstantUint64(rawTarget),
++                           /*cond=*/nullptr,
++                           /*link=*/currentInstr.lk != 0);
++
++        // Mark this block as chainable. The backend will install a chain slot;
++        // PPU_JIT will resolve it once the destination block is compiled.
++        if (currentBlock) {
++          currentBlock->chainTargetGuestAddr = effectiveTarget;
++        }
+       }
+ 
++      // bc / bcl / bca / bcla -- conditional with translate-time-known target.
+       void HIRBuilder::BranchConditional(uPPCInstr currentInstr) {
+-        Instr *i = AppendInstr(OPCODE_BRANCH_CONDITIONAL_info, 0);
+-        i->src1.value = i->src2.value = i->src3.value = NULL;
+-        i->currentInstrData = currentInstr;
++        const s64 base = currentInstr.aa ? 0 : static_cast<s64>(currentInstructionAddress_);
++        const u64 rawTaken = static_cast<u64>(base + static_cast<s64>(currentInstr.bt14));
++        const u64 rawFall = currentInstructionAddress_ + 4;
++        Value *cond = ComputeBranchCondition(currentInstr.bo, currentInstr.bi, /*noCtrDec=*/false);
++        EmitBranchEpilogue(LoadConstantUint64(rawTaken),
++                           cond,
++                           /*link=*/currentInstr.lk != 0);
++
++        // Record both successors as chainable. LK=1 (`bcl`) is fine: the LR
++        // write happened above, the chain target is the resolved NIA, and the
++        // chain budget bounds host stack growth across nested calls — same
++        // contract as the existing `bl` chaining in Branch().
++        // When cond is null the branch was actually unconditional; only the
++        // taken target is set and Branch() would normally have been used
++        // instead.
++        if (currentBlock) {
++          const u64 effTaken = msrSF_ ? rawTaken : (rawTaken & 0xFFFFFFFFULL);
++          currentBlock->chainTargetGuestAddr = effTaken;
++          if (cond) {
++            const u64 effFall = msrSF_ ? rawFall : (rawFall & 0xFFFFFFFFULL);
++            currentBlock->chainTargetGuestAddrFall = effFall;
++          }
++        }
+       }
+ 
++      // bcctr / bcctrl -- conditional, target = CTR & ~3. CTR is never decremented
++      // for this form (BO[2] must be 1 per ISA).
+       void HIRBuilder::BranchConditionalToCTR(uPPCInstr currentInstr) {
+-        Instr *i = AppendInstr(OPCODE_BRANCH_CONDITIONAL_CTR_info, 0);
+-        i->src1.value = i->src2.value = i->src3.value = NULL;
+-        i->currentInstrData = currentInstr;
++        Value *target = And(LoadCTR(), LoadConstantUint64(~3ULL));
++        Value *cond = ComputeBranchCondition(currentInstr.bo, currentInstr.bi, /*noCtrDec=*/true);
++        EmitBranchEpilogue(target, cond, /*link=*/currentInstr.lk != 0);
+       }
+ 
++      // bclr / bclrl -- conditional, target = LR & ~3. Capture LR *before*
++      // the LK=1 LR write would overwrite it.
+       void HIRBuilder::BranchConditionalToLR(uPPCInstr currentInstr) {
+-        Instr *i = AppendInstr(OPCODE_BRANCH_CONDITIONAL_LR_info, 0);
+-        i->src1.value = i->src2.value = i->src3.value = NULL;
+-        i->currentInstrData = currentInstr;
++        Value *target = And(LoadLR(), LoadConstantUint64(~3ULL));
++        Value *cond = ComputeBranchCondition(currentInstr.bo, currentInstr.bi, /*noCtrDec=*/false);
++        EmitBranchEpilogue(target, cond, /*link=*/currentInstr.lk != 0);
+       }
+ 
+       void HIRBuilder::Comment(std::string_view value) {
+@@ -482,6 +691,7 @@ namespace Xe {
+       }
+ 
+       void HIRBuilder::SourceOffset(u64 addr, u32 rawWord, bool needsFullPrologue) {
++        currentInstructionAddress_ = addr;
+         Instr *i = AppendInstr(OPCODE_SOURCE_OFFSET_info, needsFullPrologue ? 1 : 0);
+         i->src1.offset = addr;
+         i->src2.value = i->src3.value = NULL;
+@@ -543,6 +753,54 @@ namespace Xe {
+         i->currentInstrData = instrData;
+       }
+ 
++      Value *HIRBuilder::LoadTimeBase() {
++        Instr *i = AppendInstr(OPCODE_LOAD_TIME_BASE_info, 0, AllocValue(INT64_TYPE));
++        i->src1.value = i->src2.value = i->src3.value = NULL;
++        return i->dest;
++      }
++
++      Value *HIRBuilder::EmitMFSPR(uPPCInstr instrData) {
++        Instr *i = AppendInstr(OPCODE_MFSPR_info, 0, AllocValue(INT64_TYPE));
++        i->src1.value = i->src2.value = i->src3.value = NULL;
++        i->currentInstrData = instrData;
++        return i->dest;
++      }
++
++      void HIRBuilder::EmitMTSPR(Value *sprValue, uPPCInstr instrData) {
++        Instr *i = AppendInstr(OPCODE_MTSPR_info, 0);
++        i->set_src1(sprValue);
++        i->src2.value = i->src3.value = NULL;
++        i->currentInstrData = instrData;
++      }
++
++      void HIRBuilder::EmitMTMSRD(Value *sprValue, uPPCInstr instrData) {
++        Instr *i = AppendInstr(OPCODE_MTMSRD_info, 0);
++        i->set_src1(sprValue);
++        i->src2.value = i->src3.value = NULL;
++        i->currentInstrData = instrData;
++      }
++
++      void HIRBuilder::EmitSyscall(uPPCInstr instrData) {
++        Instr *i = AppendInstr(OPCODE_SYSCALL_info, 0);
++        i->src1.value = i->src2.value = i->src3.value = NULL;
++        i->currentInstrData = instrData;
++      }
++
++      void HIRBuilder::EmitRFID(uPPCInstr instrData) {
++        Instr *i = AppendInstr(OPCODE_RFID_info, 0);
++        i->src1.value = i->src2.value = i->src3.value = NULL;
++        i->currentInstrData = instrData;
++      }
++
++      void HIRBuilder::CallHLEFunction(Core::HLE::HLEFunctionPtr fnPtr) {
++        // Encode the host function pointer in src1.offset (u64).
++        // The backend will emit a call to fnPtr(ppeState).
++        Instr *i = AppendInstr(OPCODE_CALL_HLE_FUNCTION_info, 0);
++        i->src1.offset = reinterpret_cast<u64>(fnPtr);
++        i->src2.value = nullptr;
++        i->src3.value = nullptr;
++      }
++
+       Value *HIRBuilder::Assign(Value *value) {
+         if (value->IsConstant()) {
+           return value;
+@@ -835,6 +1093,22 @@ namespace Xe {
+       Value *HIRBuilder::Sub(Value *value1, Value *value2, u32 arithmeticFlags) {
+         ASSERT_TYPES_EQUAL(value1, value2);
+ 
++        if (!arithmeticFlags) {
++          // x - 0 = x
++          if (value2->IsConstantZero()) {
++            return value1;
++          }
++          // x - x = 0
++          if (value1 == value2) {
++            return LoadZero(value1->type);
++          }
++          if (value1->IsConstant() && value2->IsConstant()) {
++            Value *dest = CloneValue(value1);
++            dest->Sub(value2);
++            return dest;
++          }
++        }
++
+         Instr *i =
+           AppendInstr(OPCODE_SUB_info, arithmeticFlags, AllocValue(value1->type));
+         i->set_src1(value1);
+@@ -1372,19 +1646,12 @@ namespace Xe {
+ 
+       void HIRBuilder::MemoryBarrier() { AppendInstr(OPCODE_MEMORY_BARRIER_info, 0); }
+ 
+-      Value *HIRBuilder::LoadReserved(Value *address, TypeName type) {
+-        Instr *i = AppendInstr(OPCODE_LOAD_RESERVED_info, 0, AllocValue(type));
+-        i->set_src1(address);
+-        i->src2.value = i->src3.value = NULL;
+-        return i->dest;
++      Value *HIRBuilder::LoadReserved() {
++        return LoadContext(offsetof(sPPUThread, reservedValue), INT64_TYPE);
+       }
+ 
+-      void HIRBuilder::StoreReserved(Value *address, Value *value, TypeName type) {
+-        ASSERT_ADDRESS_TYPE(address);
+-        Instr *i = AppendInstr(OPCODE_STORE_RESERVED_info, static_cast<u32>(type));
+-        i->set_src1(address);
+-        i->set_src2(value);
+-        i->src3.value = NULL;
++      void HIRBuilder::StoreReserved(Value *value) {
++        StoreContext(offsetof(sPPUThread, reservedValue), value);
+       }
+ 
+       // Vector128 Operations
