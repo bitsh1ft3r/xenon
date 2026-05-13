@@ -40,13 +40,16 @@ namespace Xe {
 
         uint16_t ordinal;
 
-        // If this block ends with an unconditional `b` whose target is a
-        // translate-time-constant guest address, the backend installs a chain
-        // slot so the emitted tail can dispatch directly into the destination
-        // block's host code (skipping the dispatcher hashmap lookup). Set by
-        // HIRBuilder::Branch when the target is proved constant.
-        // Holds the post-MSR-truncation guest address, NOT the cache key.
+        // If this block ends with a branch to a translate-time-constant guest
+        // address, the backend installs a chain slot so the emitted tail can
+        // dispatch directly into the destination block's host code (skipping
+        // the dispatcher hashmap lookup).
+        // chainTargetGuestAddr:     taken-path target (set by Branch / BranchConditional)
+        // chainTargetGuestAddrFall: fall-through target for `bc` (set by BranchConditional)
+        // Both hold the post-MSR-truncation guest address, NOT the cache key.
+        // INVALID_CHAIN_TARGET means "not chainable on this path".
         uint64_t chainTargetGuestAddr;
+        uint64_t chainTargetGuestAddrFall;
 
         void AssertNoCycles();
       };

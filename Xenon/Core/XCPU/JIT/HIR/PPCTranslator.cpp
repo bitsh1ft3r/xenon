@@ -94,7 +94,8 @@ namespace Xe {
                                           u64 maxInstrs, u64 *outCodeSize,
                                           HIRBlockMetadata *outMeta,
                                           ePPUThreadID threadId,
-                                          void ***outChainSlot) {
+                                          void ***outChainSlot,
+                                          void ***outChainSlotFall) {
         // Check backend
         if (!backend) {
           LOG_ERROR(Xenon, "[PPCTranslator]: TranslateBlock called without a backend");
@@ -356,7 +357,8 @@ namespace Xe {
             }
 
             // Propagate chain targets recorded by the branch lowering.
-            outMeta->chainTargetGuestAddr = hirBlock->chainTargetGuestAddr;
+            outMeta->chainTargetGuestAddr     = hirBlock->chainTargetGuestAddr;
+            outMeta->chainTargetGuestAddrFall = hirBlock->chainTargetGuestAddrFall;
           }
         }
 
@@ -369,7 +371,7 @@ namespace Xe {
 
         void *code = nullptr;
         u64 codeSize = 0;
-        if (!backend->EmitBlock(block, &code, &codeSize, threadId, outChainSlot)) {
+        if (!backend->EmitBlock(block, &code, &codeSize, threadId, outChainSlot, outChainSlotFall)) {
           LOG_WARNING(Xenon, "[PPCTranslator]: Backend compilation failed for {:#x}", blockStartAddress);
           return nullptr;
         }

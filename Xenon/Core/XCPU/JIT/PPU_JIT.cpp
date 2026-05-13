@@ -113,14 +113,16 @@ std::shared_ptr<JITBlock> PPU_JIT::BuildJITBlockHIR(u64 blockStartAddress, u64 m
   u64 codeSize = 0;
   HIRBlockMetadata meta;
   void **chainSlot = nullptr;
+  void **chainSlotFall = nullptr;
   void *code = hirTranslator_[tid]->TranslateBlock(blockStartAddress, ppeState, maxBlockSize,
                                                      &codeSize, &meta, threadId,
-                                                     &chainSlot);
+                                                     &chainSlot, &chainSlotFall);
 
   if (!code) {
-    // Backend should have already freed any allocated slot on failure, but
+    // Backend should have already freed any allocated slots on failure, but
     // guard here in case a future backend forgets.
     delete chainSlot;
+    delete chainSlotFall;
     return nullptr;
   }
 
@@ -135,8 +137,10 @@ std::shared_ptr<JITBlock> PPU_JIT::BuildJITBlockHIR(u64 blockStartAddress, u64 m
   // Set metadata from the HIR translator.
   block->hash = meta.hash;
   block->msrSF = meta.msrSF;
-  block->chainSlot = chainSlot;
-  block->chainTargetGuestAddr = meta.chainTargetGuestAddr;
+  block->chainSlot             = chainSlot;
+  block->chainSlotFall         = chainSlotFall;
+  block->chainTargetGuestAddr     = meta.chainTargetGuestAddr;
+  block->chainTargetGuestAddrFall = meta.chainTargetGuestAddrFall;
 
   // Insert block into the cache under a key that encodes MSR.SF so 32-bit
   // and 64-bit specializations of the same address coexist.
@@ -159,6 +163,10 @@ std::shared_ptr<JITBlock> PPU_JIT::BuildJITBlockHIR(u64 blockStartAddress, u64 m
   if (chainSlot && meta.chainTargetGuestAddr != ~0ULL) {
     const u64 targetKey = ComposeBlockCacheKey(meta.chainTargetGuestAddr, meta.msrSF);
     RegisterChainEdge(cacheKey, targetKey, chainSlot, block.get(), cache);
+  }
+  if (chainSlotFall && meta.chainTargetGuestAddrFall != ~0ULL) {
+    const u64 targetKeyFall = ComposeBlockCacheKey(meta.chainTargetGuestAddrFall, meta.msrSF);
+    RegisterChainEdge(cacheKey, targetKeyFall, chainSlotFall, block.get(), cache);
   }
   ResolveChainsFor(cacheKey, funcPtr, cache);
 

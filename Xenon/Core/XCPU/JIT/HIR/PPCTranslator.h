@@ -44,7 +44,8 @@ namespace Xe {
                              u64 maxInstrs = 64, u64 *outCodeSize = nullptr,
                              HIRBlockMetadata *outMeta = nullptr,
                              ePPUThreadID threadId = ePPUThread_Zero,
-                             void ***outChainSlot = nullptr);
+                             void ***outChainSlot = nullptr,
+                             void ***outChainSlotFall = nullptr);
 
         // Access the builder for optimization passes or backend emission.
         HIR::HIRBuilder &GetBuilder() { return builder; }

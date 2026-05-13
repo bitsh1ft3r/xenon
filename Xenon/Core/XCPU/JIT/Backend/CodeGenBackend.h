@@ -28,7 +28,8 @@ namespace Xe {
         // outChainSlot is set to nullptr when the block is not chainable.
         virtual bool EmitBlock(HIR::HIRBlock *block, void **outCode, u64 *outCodeSize,
                                ePPUThreadID threadId = ePPUThread_Zero,
-                               void ***outChainSlot = nullptr) = 0;
+                               void ***outChainSlot = nullptr,
+                               void ***outChainSlotFall = nullptr) = 0;
 
         // Release a previously compiled code pointer.
         virtual void ReleaseCode(void *codePtr) = 0;

@@ -284,11 +284,14 @@ struct HIRBlockMetadata {
   bool lastWasBranch = false; // Whether the last instruction was a branch
   bool msrSF = true;      // MSR.SF mode this block was specialized for
                           // (true = 64-bit, false = 32-bit). Used by the cache key.
-  // Constant chain target (post-MSR-truncation guest address). Mirrors
-  // HIRBlock::chainTargetGuestAddr so PPU_JIT can wire the chain without
-  // re-walking the HIR after backend emission. Only set for unconditional `b`.
-  // ~0ULL means this block is not chainable.
+  // Constant chain targets (post-MSR-truncation guest address). Mirror
+  // HIRBlock::chainTargetGuestAddr/Fall so PPU_JIT can wire chains without
+  // re-walking the HIR after backend emission.
+  // chainTargetGuestAddr:     taken path (unconditional `b`, or `bc` taken).
+  // chainTargetGuestAddrFall: fall-through path for `bc` only.
+  // ~0ULL means this path is not chainable.
   u64 chainTargetGuestAddr = ~0ULL;
+  u64 chainTargetGuestAddrFall = ~0ULL;
 };
 
 using namespace asmjit;
@@ -370,8 +373,10 @@ public:
   // executions skip the dispatcher hashmap lookup.
   // chainTargetGuestAddr holds the post-MSR-truncation guest address (NOT
   // the composite cache key); compose it with msrSF at lookup time.
-  void **chainSlot = nullptr;
+  void **chainSlot = nullptr;          // taken-path slot
+  void **chainSlotFall = nullptr;      // fall-through slot (bc only)
   u64 chainTargetGuestAddr = ~0ULL;
+  u64 chainTargetGuestAddrFall = ~0ULL;
 
   ~JITBlock() {
     // Release (delete) the code pointer allocated by asmjit
@@ -380,10 +385,12 @@ public:
       if (runtimeMutex) lock = std::unique_lock<std::mutex>(*runtimeMutex);
       runtime->release(codePtr);
     }
-    // Free the chain slot cell. The dispatcher must have already removed any
-    // registry entries that reference it.
+    // Free the chain slot cells. The dispatcher must have already removed any
+    // registry entries that reference them.
     delete chainSlot;
     chainSlot = nullptr;
+    delete chainSlotFall;
+    chainSlotFall = nullptr;
   }
 
   bool Build() {

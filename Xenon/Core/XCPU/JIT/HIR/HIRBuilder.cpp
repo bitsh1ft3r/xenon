@@ -81,6 +81,7 @@ namespace Xe {
         currentBlock = block;
         block->instr_head = block->instr_tail = NULL;
         block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
+        block->chainTargetGuestAddrFall = INVALID_CHAIN_TARGET;
         return block;
       }
 
@@ -604,8 +605,17 @@ namespace Xe {
         Value *cond = ComputeBranchCondition(currentInstr.bo, currentInstr.bi, false);
         EmitBranchEpilogue(LoadConstantUint64(rawTaken), cond, currentInstr.lk != 0);
 
-        // `bc` targets are not chained; only unconditional `b` is.
-        // (See HIRBuilder::Branch for the chain slot assignment.)
+        // Record both successors as chainable so the backend installs slots for
+        // both the taken path and the fall-through path. When cond is null the
+        // branch was degenerate-unconditional; only the taken target is set.
+        if (currentBlock) {
+          const u64 effTaken = msrSF_ ? rawTaken : (rawTaken & 0xFFFFFFFFULL);
+          currentBlock->chainTargetGuestAddr = effTaken;
+          if (cond) {
+            const u64 effFall = msrSF_ ? rawFall : (rawFall & 0xFFFFFFFFULL);
+            currentBlock->chainTargetGuestAddrFall = effFall;
+          }
+        }
       }
 
       // bcctr / bcctrl -- conditional, target = CTR & ~3. CTR is never decremented

@@ -1079,12 +1079,14 @@ namespace Xe {
 
       // Emit code for a full HIR block.
       bool x86CodeGenBackend::EmitBlock(HIR::HIRBlock *block, void **outCode, u64 *outCodeSize,
-                                        ePPUThreadID threadId, void ***outChainSlot) {
+                                        ePPUThreadID threadId, void ***outChainSlot,
+                                        void ***outChainSlotFall) {
         if (!block || !outCode || !outCodeSize) return false;
 
         *outCode = nullptr;
         *outCodeSize = 0;
         if (outChainSlot) *outChainSlot = nullptr;
+        if (outChainSlotFall) *outChainSlotFall = nullptr;
 
         // Set up asmjit code holder for this block.
         codeHolder.reset();
@@ -1155,10 +1157,10 @@ namespace Xe {
         // When the HIR translator proved the block ends with a branch to a
         // translate-time-constant guest address, allocate one `void *` slot
         // per chainable successor and emit a tail of the form:
-        //   if (--thread.jitChainBudget < 0)        skip   // bound recursion
+        //   if (thread.jitChainBudget == 0) goto skip    // bound recursion
+        //   --thread.jitChainBudget
         //   load nia from thread context
-        //   if (nia == takenConst && (t = *takenSlot)) call(t); skip
-        //   if (nia == fallConst  && (t = *fallSlot )) call(t); skip
+        //   for each slot (taken, fall): if (nia==const && *slot) call(*slot); goto skip
         //   skip: ret
         // The dispatcher patches each slot to the destination block's host
         // code pointer once that block is compiled, so the chain tail becomes
@@ -1167,12 +1169,15 @@ namespace Xe {
         // chain hop adds one host stack frame. The chain budget caps the
         // depth so cycles like B->C->B are bounded.
         void **chainSlot = nullptr;
+        void **chainSlotFall = nullptr;
         const bool hasTaken = outChainSlot && block->chainTargetGuestAddr != HIR::INVALID_CHAIN_TARGET;
-        if (hasTaken) {
-          chainSlot = new void *(nullptr);
+        const bool hasFall  = outChainSlotFall && block->chainTargetGuestAddrFall != HIR::INVALID_CHAIN_TARGET;
+        if (hasTaken || hasFall) {
+          if (hasTaken)  chainSlot     = new void *(nullptr);
+          if (hasFall)   chainSlotFall = new void *(nullptr);
 
           asmjit::Label skipChain = comp.newLabel();
-          asmjit::Label doInvoke = comp.newLabel();
+          asmjit::Label doInvoke  = comp.newLabel();
 
           // Budget gate: if the per-thread chain counter has reached zero,
           // return to the dispatcher instead of recursing further.
@@ -1184,22 +1189,33 @@ namespace Xe {
           comp.dec(budgetReg);
           comp.mov(budgetMem, budgetReg);
 
-          // Load the resolved NIA written by the branch lowering.
-          asmjit::x86::Gp niaReg = comp.newGpz("chain_nia");
+          // Load the resolved NIA. The branch lowering wrote it to NIA via
+          // Select(cond, taken, fallthrough) before this tail runs.
+          asmjit::x86::Gp niaReg     = comp.newGpz("chain_nia");
+          asmjit::x86::Gp constReg   = comp.newGpz("chain_const");
+          asmjit::x86::Gp slotPtrReg = comp.newGpz("chain_slot_ptr");
+          asmjit::x86::Gp targetReg  = comp.newGpz("chain_target");
           comp.mov(niaReg, ctxPtr.scalar(&sPPUThread::NIA));
 
-          asmjit::x86::Gp constReg = comp.newGpz("chain_const");
-          asmjit::x86::Gp slotPtrReg = comp.newGpz("chain_slot_ptr");
-          asmjit::x86::Gp targetReg = comp.newGpz("chain_target");
+          // Emit a single slot check: compare NIA, load slot, branch to invoke.
+          auto emitCheck = [&](u64 targetGuestAddr, void **slot) {
+            asmjit::Label nextCheck = comp.newLabel();
+            comp.mov(constReg, asmjit::imm(targetGuestAddr));
+            comp.cmp(niaReg, constReg);
+            comp.jne(nextCheck);
+            comp.mov(slotPtrReg, asmjit::imm((void *)slot));
+            comp.mov(targetReg, asmjit::x86::ptr(slotPtrReg));
+            comp.test(targetReg, targetReg);
+            comp.jz(skipChain);
+            comp.jmp(doInvoke);
+            comp.bind(nextCheck);
+          };
 
-          comp.mov(constReg, asmjit::imm(block->chainTargetGuestAddr));
-          comp.cmp(niaReg, constReg);
-          comp.jne(skipChain);
-          comp.mov(slotPtrReg, asmjit::imm((void *)chainSlot));
-          comp.mov(targetReg, asmjit::x86::ptr(slotPtrReg));
-          comp.test(targetReg, targetReg);
-          comp.jz(skipChain);
-          comp.jmp(doInvoke);
+          if (hasTaken) emitCheck(block->chainTargetGuestAddr,     chainSlot);
+          if (hasFall)  emitCheck(block->chainTargetGuestAddrFall, chainSlotFall);
+
+          // No successor matched — fall back to the dispatcher.
+          comp.jmp(skipChain);
 
           comp.bind(doInvoke);
           asmjit::InvokeNode *chainCall = nullptr;
@@ -1225,6 +1241,7 @@ namespace Xe {
           LOG_ERROR(Xenon, "[x86Backend]: asmjit finalize error: {}", asmjit::DebugUtils::errorAsString(err));
           DumpHIR(block);
           delete chainSlot;
+          delete chainSlotFall;
           return false;
         }
 
@@ -1238,8 +1255,6 @@ namespace Xe {
           }
         }
 
-
-
         // Add compiled code to the runtime. The pointer is now owned by the caller
         // via the shared JitRuntime; caller releases with ReleaseCode().
         void *codePtr = nullptr;
@@ -1251,13 +1266,15 @@ namespace Xe {
         if (err || !codePtr) {
           LOG_ERROR(Xenon, "[x86Backend]: asmjit runtime add error: {}", asmjit::DebugUtils::errorAsString(err));
           delete chainSlot;
+          delete chainSlotFall;
           return false;
         }
 
         // Return generated code and code size
         *outCode = codePtr;
         *outCodeSize = codeHolder.codeSize();
-        if (outChainSlot) *outChainSlot = chainSlot;
+        if (outChainSlot)     *outChainSlot     = chainSlot;
+        if (outChainSlotFall) *outChainSlotFall = chainSlotFall;
         return true;
       }
 

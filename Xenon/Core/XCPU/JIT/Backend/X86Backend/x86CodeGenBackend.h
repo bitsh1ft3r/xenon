@@ -48,7 +48,8 @@ namespace Xe {
         bool Initialize() override;
         bool EmitBlock(HIR::HIRBlock *block, void **outCode, u64 *outCodeSize,
                        ePPUThreadID threadId = ePPUThread_Zero,
-                       void ***outChainSlot = nullptr) override;
+                       void ***outChainSlot = nullptr,
+                       void ***outChainSlotFall = nullptr) override;
         void ReleaseCode(void *codePtr) override;
         void Reset() override;
 
