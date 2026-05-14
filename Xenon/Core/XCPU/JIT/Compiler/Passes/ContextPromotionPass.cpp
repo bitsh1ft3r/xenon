@@ -58,20 +58,20 @@ namespace Xe {
 
           // Promote loads to values.
           // Process each block independently, for now.
-          auto block = builder->getCurrentBlock();
+          auto block = builder->getBlockHead();
           while (block) {
             PromoteBlock(block);
-            block = NULL; //No next block
+            block = block->next;
           }
 
           // Remove all dead stores.
           // This will break debugging as we can't recover this information when
           // trying to extract stack traces/register values, so we don't do that.
           if (false) { //(!cvars::debug && !cvars::store_all_context_values) {
-            block = builder->getCurrentBlock();
+            block = builder->getBlockHead();
             while (block) {
               RemoveDeadStoresBlock(block);
-              block = NULL; //No next block
+              block = block->next;
             }
           }
 

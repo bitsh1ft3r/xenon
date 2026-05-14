@@ -810,27 +810,40 @@ namespace Xe {
       }
 
       // Unconditional intra-function jump (per-function mode only).
-      // src1.offset holds the HIRBlock* target cast to u64.
-      REGISTER_EMITTER(OPCODE_BRANCH_LABEL, Emit_BRANCH_LABEL)
-      static void Emit_BRANCH_LABEL(x86CodeGenBackend *b, const HIR::Instr *instr) {
-        auto *targetBlock = reinterpret_cast<HIR::HIRBlock *>(instr->src1.offset);
+      // src1.label holds the Label* whose block is the jump target.
+      REGISTER_EMITTER(OPCODE_BRANCH, Emit_BRANCH)
+      static void Emit_BRANCH(x86CodeGenBackend *b, const HIR::Instr *instr) {
+        auto *targetBlock = instr->src1.label->block;
         asmjit::Label lbl = b->GetFunctionBlockLabel(targetBlock);
         if (lbl.isValid()) {
           COMP->jmp(lbl);
         }
       }
 
-      // Conditional intra-function jump (per-function mode only).
-      // src1.value = INT8 condition; src2.offset holds the taken HIRBlock* cast to u64.
+      // Conditional intra-function jump — taken when src1.value != 0 (per-function mode only).
+      // src1.value = INT8 condition; src2.label = Label* of taken target.
       // Fallthrough (condition false) continues to the immediately following block.
-      REGISTER_EMITTER(OPCODE_BRANCH_TRUE_LABEL, Emit_BRANCH_TRUE_LABEL)
-      static void Emit_BRANCH_TRUE_LABEL(x86CodeGenBackend *b, const HIR::Instr *instr) {
-        auto *targetBlock = reinterpret_cast<HIR::HIRBlock *>(instr->src2.offset);
+      REGISTER_EMITTER(OPCODE_BRANCH_TRUE, Emit_BRANCH_TRUE)
+      static void Emit_BRANCH_TRUE(x86CodeGenBackend *b, const HIR::Instr *instr) {
+        auto *targetBlock = instr->src2.label->block;
         asmjit::Label lbl = b->GetFunctionBlockLabel(targetBlock);
         if (lbl.isValid()) {
           x86::Gp cond = LoadValueGp(b, instr->src1.value);
           COMP->test(cond.r8(), cond.r8());
           COMP->jnz(lbl);
+        }
+      }
+
+      // Conditional intra-function jump — taken when src1.value == 0 (per-function mode only).
+      // src1.value = INT8 condition; src2.label = Label* of taken target.
+      REGISTER_EMITTER(OPCODE_BRANCH_FALSE, Emit_BRANCH_FALSE)
+      static void Emit_BRANCH_FALSE(x86CodeGenBackend *b, const HIR::Instr *instr) {
+        auto *targetBlock = instr->src2.label->block;
+        asmjit::Label lbl = b->GetFunctionBlockLabel(targetBlock);
+        if (lbl.isValid()) {
+          x86::Gp cond = LoadValueGp(b, instr->src1.value);
+          COMP->test(cond.r8(), cond.r8());
+          COMP->jz(lbl);
         }
       }
 
@@ -1303,7 +1316,7 @@ namespace Xe {
 
       // Emit native code for an entire multi-block function (per-function mode).
       // All blocks in the chain are compiled into one CodeHolder so intra-function
-      // label jumps (OPCODE_BRANCH_LABEL / OPCODE_BRANCH_TRUE_LABEL) resolve
+      // label jumps (OPCODE_BRANCH / OPCODE_BRANCH_TRUE / OPCODE_BRANCH_FALSE) resolve
       // within a single asmjit finalize() without re-entering the dispatcher.
       bool x86CodeGenBackend::EmitFunction(HIR::HIRBlock *blockHead, void **outCode,
                                            u64 *outCodeSize, ePPUThreadID threadId,
@@ -1375,10 +1388,10 @@ namespace Xe {
           // leaving dead code after unconditional jmps). The logical exit instruction
           // that matters is the one BEFORE the trailing checks.
           //
-          // OPCODE_BRANCH_LABEL       → unconditional jmp already emitted; no extra ret.
-          // OPCODE_BRANCH_TRUE_LABEL  → conditional jcc emitted; fallthrough goes to the
-          //                             next block whose label is bound immediately after.
-          // Everything else           → external exit (NIA stored); emit ret to dispatcher.
+          // OPCODE_BRANCH       → unconditional jmp already emitted; no extra ret.
+          // OPCODE_BRANCH_TRUE  → conditional jnz emitted; fallthrough goes to the
+          // OPCODE_BRANCH_FALSE   next block whose label is bound immediately after.
+          // Everything else     → external exit (NIA stored); emit ret to dispatcher.
           const HIR::Instr *exitInstr = lastInstr;
           while (exitInstr && exitInstr->opcode &&
                  exitInstr->opcode->num == HIR::OPCODE_SYNC_EXCEPTION_CHECK) {
@@ -1387,7 +1400,8 @@ namespace Xe {
           bool needsRet = true;
           if (exitInstr && exitInstr->opcode) {
             HIR::Opcode exitOp = exitInstr->opcode->num;
-            if (exitOp == HIR::OPCODE_BRANCH_LABEL || exitOp == HIR::OPCODE_BRANCH_TRUE_LABEL) {
+            if (exitOp == HIR::OPCODE_BRANCH || exitOp == HIR::OPCODE_BRANCH_TRUE ||
+                exitOp == HIR::OPCODE_BRANCH_FALSE) {
               needsRet = false;
             }
           }
