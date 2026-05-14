@@ -58,6 +58,9 @@ namespace Xe {
       // Reset builder
       void HIRBuilder::Reset() {
         currentBlock = NULL;
+        block_head_ = nullptr;
+        block_tail_ = nullptr;
+        intraFunctionTargets_ = nullptr;
         nextValueOrdinal = 0;
         currentInstructionAddress_ = 0;
         msrSF_ = true;  // Default to 64-bit mode; translator overrides per block.
@@ -71,17 +74,50 @@ namespace Xe {
       // Returns a pointer to the current block
       HIRBlock *HIRBuilder::getCurrentBlock() const { return currentBlock; }
 
-      // Appends a block onto code arena
+      // Appends a block onto code arena and links it into the block chain.
       HIRBlock *HIRBuilder::AppendBlock() {
-        // Allocate new block in block arena
         HIRBlock *block = arena_->Alloc<HIRBlock>();
         block->ordinal = UINT16_MAX;
         block->incoming_values = nullptr;
         block->arena = arena_;
-        currentBlock = block;
         block->instr_head = block->instr_tail = NULL;
         block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
+        block->next = nullptr;
+        block->prev = block_tail_;
+        if (block_tail_) {
+          block_tail_->next = block;
+        } else {
+          block_head_ = block;
+        }
+        block_tail_ = block;
+        currentBlock = block;
         return block;
+      }
+
+      // Allocates and chains a new block WITHOUT switching the active build target.
+      // Used by TranslateFunction to pre-populate the block map before translation.
+      HIRBlock *HIRBuilder::AllocBlock() {
+        HIRBlock *block = arena_->Alloc<HIRBlock>();
+        block->ordinal = UINT16_MAX;
+        block->incoming_values = nullptr;
+        block->arena = arena_;
+        block->instr_head = block->instr_tail = NULL;
+        block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
+        block->next = nullptr;
+        block->prev = block_tail_;
+        if (block_tail_) {
+          block_tail_->next = block;
+        } else {
+          block_head_ = block;
+        }
+        block_tail_ = block;
+        // NOTE: currentBlock is NOT updated here.
+        return block;
+      }
+
+      // Switches the active build target to an already-allocated block.
+      void HIRBuilder::SwitchToBlock(HIRBlock *block) {
+        currentBlock = block;
       }
 
       //
@@ -587,11 +623,22 @@ namespace Xe {
         // block runs, and therefore the dispatcher's lookup key.
         const u64 effectiveTarget = msrSF_ ? rawTarget : (rawTarget & 0xFFFFFFFFULL);
 
+        // Per-function mode: if LK=0 and the target is an intra-function block,
+        // emit a direct label jump instead of the NIA-store + dispatcher-return path.
+        if (!currentInstr.lk && intraFunctionTargets_) {
+          auto it = intraFunctionTargets_->find(effectiveTarget);
+          if (it != intraFunctionTargets_->end()) {
+            Instr *i = AppendInstr(OPCODE_BRANCH_LABEL_info, 0);
+            i->src1.offset = reinterpret_cast<u64>(it->second);
+            return;
+          }
+        }
+
         EmitBranchEpilogue(LoadConstantUint64(rawTarget), nullptr, currentInstr.lk != 0);
 
-        // Mark this block as chainable. The backend will install a chain slot;
-        // PPU_JIT will resolve it once the destination block is compiled.
-        if (currentBlock) {
+        // Mark this block as chainable (per-block path only).
+        // In per-function mode the block is already linked; no chain slot needed.
+        if (!intraFunctionTargets_ && currentBlock) {
           currentBlock->chainTargetGuestAddr = effectiveTarget;
         }
       }
@@ -600,8 +647,21 @@ namespace Xe {
       void HIRBuilder::BranchConditional(uPPCInstr currentInstr) {
         const s64 base = currentInstr.aa ? 0 : static_cast<s64>(currentInstructionAddress_);
         const u64 rawTaken = static_cast<u64>(base + static_cast<s64>(currentInstr.bt14));
-        const u64 rawFall = currentInstructionAddress_ + 4;
+        const u64 effectiveTaken = msrSF_ ? rawTaken : (rawTaken & 0xFFFFFFFFULL);
         Value *cond = ComputeBranchCondition(currentInstr.bo, currentInstr.bi, false);
+
+        // Per-function mode: if LK=0 and the taken target is an intra-function block,
+        // emit a conditional label jump. The fallthrough is the next block in the chain.
+        if (!currentInstr.lk && cond && intraFunctionTargets_) {
+          auto it = intraFunctionTargets_->find(effectiveTaken);
+          if (it != intraFunctionTargets_->end()) {
+            Instr *i = AppendInstr(OPCODE_BRANCH_TRUE_LABEL_info, 0);
+            i->set_src1(cond);
+            i->src2.offset = reinterpret_cast<u64>(it->second);
+            return;
+          }
+        }
+
         EmitBranchEpilogue(LoadConstantUint64(rawTaken), cond, currentInstr.lk != 0);
 
         // `bc` targets are not chained; only unconditional `b` is.

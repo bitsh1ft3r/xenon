@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include <vector>
 
 #include "Base/StringBuffer.h"
@@ -44,6 +45,28 @@ namespace Xe {
         bool GetMSRSF() const { return msrSF_; }
 
         HIRBlock *getCurrentBlock() const;
+
+        // Per-function mode: returns the head of the block linked list.
+        // nullptr in per-block mode (only one block is ever allocated).
+        HIRBlock *getBlockHead() const { return block_head_; }
+
+        // Allocate a new HIRBlock and append it to the chain WITHOUT switching
+        // the active build target. Used by TranslateFunction to pre-allocate
+        // one block per scanner BlockInfo before any instruction is emitted,
+        // so forward-branch targets are known at emit time.
+        HIRBlock *AllocBlock();
+
+        // Switch the active build target to an already-allocated block.
+        // Used by TranslateFunction after AllocBlock to fill each block in order.
+        void SwitchToBlock(HIRBlock *block);
+
+        // Supply a guest-address → HIRBlock* map so Branch/BranchConditional
+        // can emit direct OPCODE_BRANCH_LABEL / OPCODE_BRANCH_TRUE_LABEL
+        // instructions for intra-function edges instead of NIA stores.
+        // Pass nullptr to clear (reverts to per-block NIA-store mode).
+        void SetIntraFunctionTargets(const std::unordered_map<u64, HIRBlock *> *map) {
+          intraFunctionTargets_ = map;
+        }
 
         void Comment(const std::string_view value);
         void Comment(const Base::StringBuffer &value);
@@ -329,6 +352,10 @@ namespace Xe {
         u32 nextValueOrdinal;
         // Current block being constructed
         HIRBlock *currentBlock;
+        // Head/tail of the block linked list (per-function mode).
+        // In per-block mode only one block exists; block_head_ == block_tail_ == that block.
+        HIRBlock *block_head_ = nullptr;
+        HIRBlock *block_tail_ = nullptr;
         // Address of the PPC instruction currently being translated.
         // Updated by SourceOffset() so per-instruction emitters (notably the branch
         // lowering) can compute targets / fallthroughs as translate-time constants.
@@ -337,6 +364,9 @@ namespace Xe {
         // (no NIA truncation needed); false = 32-bit mode (mask NIA to low 32 bits).
         // Defaults to true; the translator overrides via SetMSRSF().
         bool msrSF_;
+        // Per-function mode: guest address → pre-allocated HIRBlock* map.
+        // Set by TranslateFunction before translating; nullptr in per-block mode.
+        const std::unordered_map<u64, HIRBlock *> *intraFunctionTargets_ = nullptr;
       };
 
     }  // namespace HIR

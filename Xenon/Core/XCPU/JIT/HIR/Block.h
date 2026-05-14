@@ -30,6 +30,11 @@ namespace Xe {
       public:
         Arena *arena;
 
+        // Doubly-linked list of blocks within a function (per-function mode).
+        // nullptr in per-block mode (only one block exists).
+        HIRBlock *next = nullptr;
+        HIRBlock *prev = nullptr;
+
         llvm::BitVector *incoming_values;
 
         Label *label_head;

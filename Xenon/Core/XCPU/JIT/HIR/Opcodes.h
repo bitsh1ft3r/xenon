@@ -277,6 +277,8 @@ namespace Xe {
         OPCODE_MTSPR,
         OPCODE_MTMSRD,
         OPCODE_CALL_HLE_FUNCTION,
+        OPCODE_BRANCH_LABEL,
+        OPCODE_BRANCH_TRUE_LABEL,
         __OPCODE_MAX_VALUE,  // Keep at end.
       };
 

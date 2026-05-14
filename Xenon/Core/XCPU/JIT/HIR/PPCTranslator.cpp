@@ -380,6 +380,205 @@ namespace Xe {
         return code;
       }
 
+      bool PPCTranslator::IsFunctionModeEligible(const Analysis::PPCScanner::ScanResult &scan) {
+        if (scan.blocks.empty())        return false;
+        if (!scan.reachedCleanEnd)      return false;
+        if (scan.hasIndirectBranch)     return false;
+        if (scan.hasMsrChange)          return false;
+        if (scan.hasRfid)               return false;
+        return true;
+      }
+
+      // Per-function pipeline: scan → multi-block HIR → single native function.
+      void *PPCTranslator::TranslateFunction(u64 funcStartAddress, sPPEState *inPPEState,
+                                             u64 *outCodeSize,
+                                             HIRBlockMetadata *outMeta,
+                                             ePPUThreadID threadId,
+                                             void ***outChainSlot) {
+        if (!backend) {
+          LOG_ERROR(Xenon, "[PPCTranslator]: TranslateFunction called without a backend");
+          return nullptr;
+        }
+
+        ppeState = inPPEState;
+        auto &thread = ppeState->ppuThread[static_cast<u8>(threadId)];
+
+        // 1. Scan the function.
+        auto reader = Analysis::PPCScanner::MakeMMUReader(ppeState, threadId);
+        Analysis::PPCScanner scanner(reader);
+        Analysis::PPCScanner::ScanOptions options{};
+        options.verboseTrace = false;
+        options.stopOnInvalidWord = false;
+        options.isRestGprLr = Analysis::PPCScanner::MakeAutoRestGprLrDetector(reader);
+        const auto scan = scanner.Scan(funcStartAddress, options);
+
+        // 2. Eligibility check — fall back to per-block on any disqualifying flag.
+        if (!IsFunctionModeEligible(scan)) {
+          return nullptr;
+        }
+
+        // 3. Reset builder and capture MSR.SF for the whole function.
+        builder.Reset();
+        const bool fnMsrSF = thread.SPR.MSR.SF != 0;
+        builder.SetMSRSF(fnMsrSF);
+
+        builder.CommentFormat("Function start: {:#x} (MSR.SF={}, {} blocks)",
+          funcStartAddress, fnMsrSF ? 1 : 0, scan.blocks.size());
+
+        // 4. Pre-allocate one HIRBlock per scanner block so forward-branch targets
+        //    are known before any instruction is translated.
+        std::unordered_map<u64, HIR::HIRBlock *> blockMap;
+        blockMap.reserve(scan.blocks.size());
+        for (const auto &bi : scan.blocks) {
+          blockMap[bi.startAddress] = builder.AllocBlock();
+        }
+
+        // 5. Wire up intra-function branch lowering.
+        builder.SetIntraFunctionTargets(&blockMap);
+
+        // 6. Translate each scanner block in guest-address order.
+        if (outMeta) {
+          outMeta->instrCount = 0;
+          outMeta->hash = 0;
+          outMeta->lastWasBranch = false;
+          outMeta->msrSF = fnMsrSF;
+          outMeta->chainTargetGuestAddr = HIR::INVALID_CHAIN_TARGET;
+        }
+
+        for (const auto &bi : scan.blocks) {
+          HIR::HIRBlock *hirBlock = blockMap[bi.startAddress];
+          builder.SwitchToBlock(hirBlock);
+          builder.CommentFormat("Function block: {:#x}", bi.startAddress);
+
+          // Walk PPC instructions from block start to end (inclusive).
+          // Mirror TranslateBlock's CIA/NIA increment protocol.
+          thread.CIA = bi.startAddress - 4;
+          thread.NIA = bi.startAddress;
+
+          u64 blockAddr = bi.startAddress;
+          while (blockAddr <= bi.endAddress && XeRunning && !XePaused) {
+            thread.PIA = thread.CIA;
+            thread.CIA = thread.NIA;  // = blockAddr
+            thread.NIA += 4;
+
+            // HLE dispatch
+            if (const Core::HLE::sHLEFunction *hleEntry = FindHLEFunction(thread.CIA)) {
+              builder.CommentFormat("{:#x}: HLE dispatch -> {} ({})",
+                thread.CIA, hleEntry->functionName,
+                reinterpret_cast<const void *>(hleEntry->functionPtr));
+              builder.SourceOffset(thread.CIA, 0, true);
+              builder.CallHLEFunction(hleEntry->functionPtr);
+              if (hleEntry->emitBranchUnconditionalToLR) {
+                uPPCInstr blrInstr{ 0x4E800020 };
+                builder.BranchConditionalToLR(blrInstr);
+                builder.CommentFormat("Block end (HLE)");
+                break;
+              } else {
+                builder.SyncExceptionCheck();
+              }
+              if (outMeta) outMeta->instrCount++;
+            }
+
+            // Fetch instruction
+            bool instrDataValid = true;
+            thread.instrFetch = true;
+            uPPCInstr op{ PPCInterpreter::MMURead32(ppeState, thread.CIA) };
+            thread.instrFetch = false;
+
+            // Abort function-mode if a storage/segment exception fires during fetch.
+            if (thread.exceptReg & ppuInstrStorageEx || thread.exceptReg & ppuInstrSegmentEx) {
+              thread.exceptReg &= ~(ppuInstrStorageEx | ppuInstrSegmentEx);
+              builder.SetIntraFunctionTargets(nullptr);
+              builder.Reset();
+              return nullptr;
+            }
+
+            u32 opcode = op.opcode;
+            u32 decodedInstr = PPCDecode(opcode);
+            u32 opName = Base::JoaatStringHash(PPCInterpreter::ppcDecoder.decodeName(opcode));
+            bool canCauseException = InstrCanCauseSyncException(opName);
+
+            builder.SourceOffset(thread.CIA, opcode, true);
+
+            if (opcode == 0xFFFFFFFF || opcode == 0xCDCDCDCD || opcode == 0x00000000) {
+              instrDataValid = false;
+              LOG_CRITICAL(Xenon, "[PPCTranslator/Fn]: Invalid instruction {:#010x} at {:#x}",
+                opcode, thread.CIA);
+            }
+
+            if (instrDataValid) {
+              for (const auto &patch : kJITPatchTable) {
+                if (static_cast<u32>(thread.CIA) == patch.address) {
+                  if (patch.isOr)
+                    builder.StoreGPR(patch.reg, builder.Or(builder.LoadGPR(patch.reg), builder.LoadConstantUint64(patch.value)));
+                  else
+                    builder.StoreGPR(patch.reg, builder.LoadConstantUint64(patch.value));
+                  break;
+                }
+              }
+
+              HIR::instructionHandlerHIR emitter = decoder.decode(opcode);
+              const std::string instrName = PPCInterpreter::ppcDecoder.getNameTable()[decodedInstr];
+              builder.CommentFormat("{:#x}: {} ({:#010x})", thread.CIA, instrName, opcode);
+
+              if (emitter != &HIR::HIRInstrEmit_invalid) {
+                emitter(builder, op);
+              } else {
+                LOG_WARNING(Xenon, "[PPCTranslator/Fn]: No emitter for '{}' at {:#x}", instrName, thread.CIA);
+                builder.CallInterpreter(op, reinterpret_cast<void *>(PPCInterpreter::ppcDecoder.decode(op.opcode)));
+              }
+            }
+
+            if (canCauseException) {
+              builder.SyncExceptionCheck();
+            }
+
+            if (outMeta) {
+              outMeta->instrCount++;
+              outMeta->hash += opcode;
+            }
+
+            blockAddr += 4;
+          }
+
+          if (outMeta && bi.endsWithBranch) {
+            outMeta->lastWasBranch = true;
+          }
+
+          builder.CommentFormat("Function block end: {:#x}", bi.endAddress);
+        }
+
+        // 7. Detach intra-function target map before optimization.
+        builder.SetIntraFunctionTargets(nullptr);
+
+        // Reset CIA/NIA so they are not left pointing mid-function.
+        thread.CIA = funcStartAddress - 4;
+        thread.NIA = funcStartAddress;
+
+        // 8. Optimize the whole multi-block function as one unit.
+        if (!compiler_->Compile(&builder)) {
+          LOG_CRITICAL(Xenon, "[PPCTranslator]: Function optimization passes failed for {:#x}!", funcStartAddress);
+          return nullptr;
+        }
+
+        // 9. Emit all blocks into a single CodeHolder.
+        HIR::HIRBlock *blockHead = builder.getBlockHead();
+        if (!blockHead) {
+          LOG_WARNING(Xenon, "[PPCTranslator]: No HIR blocks produced for function {:#x}", funcStartAddress);
+          return nullptr;
+        }
+
+        void *code = nullptr;
+        u64 codeSize = 0;
+        if (!backend->EmitFunction(blockHead, &code, &codeSize, threadId, outChainSlot)) {
+          LOG_WARNING(Xenon, "[PPCTranslator]: Backend EmitFunction failed for {:#x}", funcStartAddress);
+          return nullptr;
+        }
+
+        if (outCodeSize) *outCodeSize = codeSize;
+        return code;
+      }
+
       // Dumps the generated HIR in a human readable form
       void PPCTranslator::DumpHIR() const {
         using namespace HIR;

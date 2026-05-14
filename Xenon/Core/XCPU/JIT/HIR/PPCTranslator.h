@@ -4,12 +4,15 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "Base/Logging/Log.h"
 #include "Core/XCPU/PPU/PowerPC.h"
 #include "Core/XCPU/JIT/HIR/HIRBuilder.h"
 #include "Core/XCPU/JIT/Compiler/Compiler.h"
 #include "Core/XCPU/JIT/Backend/CodeGenBackend.h"
 #include "Core/XCPU/JIT/HIR/HIREmitters/HIRDecoder.h"
+#include "Core/XCPU/JIT/Analysis/PPCScanner.h"
 #include "Core/HLE/HLEFunction.h"
 
 // Forward declaration to avoid circular include
@@ -46,6 +49,18 @@ namespace Xe {
                              ePPUThreadID threadId = ePPUThread_Zero,
                              void ***outChainSlot = nullptr);
 
+        // Per-function pipeline: scan entire guest function → multi-block HIR →
+        // single native function in one CodeHolder.
+        // Returns nullptr if the function is ineligible for function mode (has
+        // indirect branches, MSR changes, rfid, or the scanner did not reach a
+        // clean end). Caller falls back to TranslateBlock in that case.
+        // Caller owns the returned code and must release it via backend->ReleaseCode().
+        void *TranslateFunction(u64 funcStartAddress, sPPEState *inPPEState,
+                                u64 *outCodeSize = nullptr,
+                                HIRBlockMetadata *outMeta = nullptr,
+                                ePPUThreadID threadId = ePPUThread_Zero,
+                                void ***outChainSlot = nullptr);
+
         // Access the builder for optimization passes or backend emission.
         HIR::HIRBuilder &GetBuilder() { return builder; }
 
@@ -63,6 +78,8 @@ namespace Xe {
       private:
         // Returns true if the given raw instruction word is a block-ending instruction.
         static bool IsBlockEndingInstruction(u32 instrData);
+        // Returns true if the scan result is safe for per-function mode compilation.
+        static bool IsFunctionModeEligible(const Analysis::PPCScanner::ScanResult &scan);
         const Core::HLE::sHLEFunction *FindHLEFunction(u64 guestAddress) const;
         PPU *ppu;
         sPPEState *ppeState;

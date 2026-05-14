@@ -54,90 +54,99 @@ namespace Xe {
 
         LOG_INFO(Xenon, "[HIR Dump]: === Begin HIR ===");
 
-        const Instr *instr = block->instr_head;
-        u32 instrCount = 0;
-        while (instr) {
-          if (!instr->opcode) {
-            instr = instr->next;
-            continue;
-          }
+        u32 blockIdx = 0;
+        u32 totalInstrCount = 0;
 
-          if (instr->opcode->num == OPCODE_COMMENT) {
-            const char *text = reinterpret_cast<const char *>(instr->src1.offset);
-            LOG_INFO(Xenon, "  // {}", text ? text : "");
-          }
-          else if (instr->opcode->num == OPCODE_NOP) {
-            LOG_INFO(Xenon, "  nop");
-          }
-          else {
-            const char *opName = instr->opcode->name ? instr->opcode->name : "???";
+        // Walk the full block chain (per-function mode has multiple linked blocks).
+        for (const HIRBlock *curBlock = block; curBlock; curBlock = curBlock->next, ++blockIdx) {
+          LOG_INFO(Xenon, "[HIR Dump]: -- Block {} --", blockIdx);
 
-            u32 sig = instr->opcode->signature;
-            u32 src1Type = (sig >> 3) & 0x7;
-            u32 src2Type = (sig >> 6) & 0x7;
-            u32 src3Type = (sig >> 9) & 0x7;
-
-            // Build the operand list.
-            std::string operands;
-            auto appendOperand = [&](std::string_view op) {
-              if (!operands.empty()) operands += ", ";
-              operands += op;
-              };
-
-            if (src1Type == OPCODE_SIG_TYPE_V && instr->src1.value) {
-              appendOperand(fmtVal(instr->src1.value));
-            }
-            else if (src1Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src1.offset));
-            }
-            else if (src1Type == OPCODE_SIG_TYPE_S && instr->src1.label) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
-            }
-            else if (src1Type == OPCODE_SIG_TYPE_L) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+          const Instr *instr = curBlock->instr_head;
+          u32 instrCount = 0;
+          while (instr) {
+            if (!instr->opcode) {
+              instr = instr->next;
+              continue;
             }
 
-            if (src2Type == OPCODE_SIG_TYPE_V && instr->src2.value) {
-              appendOperand(fmtVal(instr->src2.value));
+            if (instr->opcode->num == OPCODE_COMMENT) {
+              const char *text = reinterpret_cast<const char *>(instr->src1.offset);
+              LOG_INFO(Xenon, "  // {}", text ? text : "");
             }
-            else if (src2Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src2.offset));
-            }
-            else if (src2Type == OPCODE_SIG_TYPE_L) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src2.label)));
-            }
-
-            if (src3Type == OPCODE_SIG_TYPE_V && instr->src3.value) {
-              appendOperand(fmtVal(instr->src3.value));
-            }
-            else if (src3Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src3.offset));
-            }
-
-            // Emit: "  [vN = ]opname [operands]"
-            if (instr->dest) {
-              if (!operands.empty()) {
-                LOG_INFO(Xenon, "  v{} = {} {}", instr->dest->ordinal, opName, operands);
-              }
-              else {
-                LOG_INFO(Xenon, "  v{} = {}", instr->dest->ordinal, opName);
-              }
+            else if (instr->opcode->num == OPCODE_NOP) {
+              LOG_INFO(Xenon, "  nop");
             }
             else {
-              if (!operands.empty()) {
-                LOG_INFO(Xenon, "  {} {}", opName, operands);
+              const char *opName = instr->opcode->name ? instr->opcode->name : "???";
+
+              u32 sig = instr->opcode->signature;
+              u32 src1Type = (sig >> 3) & 0x7;
+              u32 src2Type = (sig >> 6) & 0x7;
+              u32 src3Type = (sig >> 9) & 0x7;
+
+              std::string operands;
+              auto appendOperand = [&](std::string_view op) {
+                if (!operands.empty()) operands += ", ";
+                operands += op;
+                };
+
+              if (src1Type == OPCODE_SIG_TYPE_V && instr->src1.value) {
+                appendOperand(fmtVal(instr->src1.value));
+              }
+              else if (src1Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src1.offset));
+              }
+              else if (src1Type == OPCODE_SIG_TYPE_S && instr->src1.label) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+              }
+              else if (src1Type == OPCODE_SIG_TYPE_L) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+              }
+
+              if (src2Type == OPCODE_SIG_TYPE_V && instr->src2.value) {
+                appendOperand(fmtVal(instr->src2.value));
+              }
+              else if (src2Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src2.offset));
+              }
+              else if (src2Type == OPCODE_SIG_TYPE_L) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src2.label)));
+              }
+
+              if (src3Type == OPCODE_SIG_TYPE_V && instr->src3.value) {
+                appendOperand(fmtVal(instr->src3.value));
+              }
+              else if (src3Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src3.offset));
+              }
+
+              if (instr->dest) {
+                if (!operands.empty()) {
+                  LOG_INFO(Xenon, "  v{} = {} {}", instr->dest->ordinal, opName, operands);
+                }
+                else {
+                  LOG_INFO(Xenon, "  v{} = {}", instr->dest->ordinal, opName);
+                }
               }
               else {
-                LOG_INFO(Xenon, "  {}", opName);
+                if (!operands.empty()) {
+                  LOG_INFO(Xenon, "  {} {}", opName, operands);
+                }
+                else {
+                  LOG_INFO(Xenon, "  {}", opName);
+                }
               }
             }
-          }
 
-          ++instrCount;
-          instr = instr->next;
+            ++instrCount;
+            ++totalInstrCount;
+            instr = instr->next;
+          }
+          LOG_INFO(Xenon, "[HIR Dump]: -- Block {} end ({} instructions) --", blockIdx, instrCount);
         }
 
-        LOG_INFO(Xenon, "[HIR Dump]: === End HIR ({} instructions) ===", instrCount);
+        LOG_INFO(Xenon, "[HIR Dump]: === End HIR ({} blocks, {} total instructions) ===",
+          blockIdx, totalInstrCount);
       }
 
       // Global emitter key list (filled at static-init by REGISTER_EMITTER)
@@ -800,6 +809,31 @@ namespace Xe {
         hleInv->setArg(0, b->ppeState->Base());
       }
 
+      // Unconditional intra-function jump (per-function mode only).
+      // src1.offset holds the HIRBlock* target cast to u64.
+      REGISTER_EMITTER(OPCODE_BRANCH_LABEL, Emit_BRANCH_LABEL)
+      static void Emit_BRANCH_LABEL(x86CodeGenBackend *b, const HIR::Instr *instr) {
+        auto *targetBlock = reinterpret_cast<HIR::HIRBlock *>(instr->src1.offset);
+        asmjit::Label lbl = b->GetFunctionBlockLabel(targetBlock);
+        if (lbl.isValid()) {
+          COMP->jmp(lbl);
+        }
+      }
+
+      // Conditional intra-function jump (per-function mode only).
+      // src1.value = INT8 condition; src2.offset holds the taken HIRBlock* cast to u64.
+      // Fallthrough (condition false) continues to the immediately following block.
+      REGISTER_EMITTER(OPCODE_BRANCH_TRUE_LABEL, Emit_BRANCH_TRUE_LABEL)
+      static void Emit_BRANCH_TRUE_LABEL(x86CodeGenBackend *b, const HIR::Instr *instr) {
+        auto *targetBlock = reinterpret_cast<HIR::HIRBlock *>(instr->src2.offset);
+        asmjit::Label lbl = b->GetFunctionBlockLabel(targetBlock);
+        if (lbl.isValid()) {
+          x86::Gp cond = LoadValueGp(b, instr->src1.value);
+          COMP->test(cond.r8(), cond.r8());
+          COMP->jnz(lbl);
+        }
+      }
+
       //
       // Call Interpreter (system instruction fallback)
       //
@@ -1261,6 +1295,148 @@ namespace Xe {
         return true;
       }
 
+      asmjit::Label x86CodeGenBackend::GetFunctionBlockLabel(HIR::HIRBlock *block) const {
+        auto it = functionBlockLabels_.find(block);
+        if (it != functionBlockLabels_.end()) return it->second;
+        return asmjit::Label();
+      }
+
+      // Emit native code for an entire multi-block function (per-function mode).
+      // All blocks in the chain are compiled into one CodeHolder so intra-function
+      // label jumps (OPCODE_BRANCH_LABEL / OPCODE_BRANCH_TRUE_LABEL) resolve
+      // within a single asmjit finalize() without re-entering the dispatcher.
+      bool x86CodeGenBackend::EmitFunction(HIR::HIRBlock *blockHead, void **outCode,
+                                           u64 *outCodeSize, ePPUThreadID threadId,
+                                           void ***outChainSlot) {
+        if (!blockHead || !outCode || !outCodeSize) return false;
+
+        *outCode = nullptr;
+        *outCodeSize = 0;
+        if (outChainSlot) *outChainSlot = nullptr;
+
+        codeHolder.reset();
+        codeHolder.init(jitRuntime->environment(), jitRuntime->cpuFeatures());
+        if (printGeneratedCode) {
+          codeHolder.setLogger(&asmLogger);
+        }
+
+        asmjit::x86::Compiler comp(&codeHolder);
+        compiler = &comp;
+
+        asmjit::FuncNode *funcNode = nullptr;
+        asmjit::Error err = comp.addFuncNode(&funcNode,
+          asmjit::FuncSignature::build<void, PPU *, sPPEState *, bool>());
+        if (err || !funcNode) {
+          LOG_ERROR(Xenon, "[x86Backend]: EmitFunction addFuncNode failed: {}",
+            asmjit::DebugUtils::errorAsString(err));
+          compiler = nullptr;
+          return false;
+        }
+
+        asmjit::x86::Gp ppuBase = comp.newGpz("ppu");
+        funcNode->setArg(0, ppuBase);
+        asmjit::x86::Gp ppeBase = comp.newGpz("ppe");
+        funcNode->setArg(1, ppeBase);
+        asmjit::x86::Gp haltArg = comp.newGpb("halt_unused");
+        funcNode->setArg(2, haltArg);
+        funcNode->frame().setAvxEnabled();
+
+        u64 threadOffset = static_cast<u8>(threadId) * sizeof(sPPUThread);
+        asmjit::x86::Gp ctxBase = comp.newGpz("ctx");
+        comp.lea(ctxBase, asmjit::x86::ptr(ppeBase, static_cast<s32>(threadOffset)));
+
+        ASMJitPtr<sPPUThread> ctxPtr(ctxBase);
+        ppuThreadCtx = &ctxPtr;
+        ASMJitPtr<PPU> ppuPtr(ppuBase);
+        ppuState = &ppuPtr;
+        ASMJitPtr<sPPEState> ppePtr(ppeBase);
+        ppeState = &ppePtr;
+
+        // First pass: allocate one asmjit label per block so forward branches resolve.
+        functionBlockLabels_.clear();
+        for (HIR::HIRBlock *b = blockHead; b; b = b->next) {
+          functionBlockLabels_[b] = comp.newLabel();
+        }
+
+        // Second pass: emit each block.
+        for (HIR::HIRBlock *b = blockHead; b; b = b->next) {
+          comp.bind(functionBlockLabels_[b]);
+          ResetProbeMemo();
+
+          const HIR::Instr *lastInstr = nullptr;
+          for (const HIR::Instr *instr = b->instr_head; instr; instr = instr->next) {
+            EmitInstruction(instr);
+            if (instr->opcode) lastInstr = instr;
+          }
+
+          // Determine the block exit type.
+          // Walk backward past any trailing SYNC_EXCEPTION_CHECK (which the outer
+          // translation loop appends unconditionally for all branch-class instructions,
+          // leaving dead code after unconditional jmps). The logical exit instruction
+          // that matters is the one BEFORE the trailing checks.
+          //
+          // OPCODE_BRANCH_LABEL       → unconditional jmp already emitted; no extra ret.
+          // OPCODE_BRANCH_TRUE_LABEL  → conditional jcc emitted; fallthrough goes to the
+          //                             next block whose label is bound immediately after.
+          // Everything else           → external exit (NIA stored); emit ret to dispatcher.
+          const HIR::Instr *exitInstr = lastInstr;
+          while (exitInstr && exitInstr->opcode &&
+                 exitInstr->opcode->num == HIR::OPCODE_SYNC_EXCEPTION_CHECK) {
+            exitInstr = exitInstr->prev;
+          }
+          bool needsRet = true;
+          if (exitInstr && exitInstr->opcode) {
+            HIR::Opcode exitOp = exitInstr->opcode->num;
+            if (exitOp == HIR::OPCODE_BRANCH_LABEL || exitOp == HIR::OPCODE_BRANCH_TRUE_LABEL) {
+              needsRet = false;
+            }
+          }
+          if (needsRet) {
+            comp.ret();
+          }
+        }
+
+        comp.endFunc();
+
+        // Labels are no longer needed after finalize; clear before releasing compiler.
+        functionBlockLabels_.clear();
+
+        err = comp.finalize();
+        compiler = nullptr;
+        ppuThreadCtx = nullptr;
+        ppeState = nullptr;
+
+        if (err) {
+          LOG_ERROR(Xenon, "[x86Backend]: EmitFunction finalize error: {}",
+            asmjit::DebugUtils::errorAsString(err));
+          return false;
+        }
+
+        if (printGeneratedCode) {
+          codeHolder.setLogger(nullptr);
+          const char *content = asmLogger.content().data();
+          if (content && content[0] != '\0') {
+            LOG_DEBUG(Xenon, "[x86Backend]: EmitFunction generated assembly:\n{}", content);
+          }
+        }
+
+        void *codePtr = nullptr;
+        {
+          std::unique_lock<std::mutex> lock;
+          if (jitRuntimeMutex) lock = std::unique_lock<std::mutex>(*jitRuntimeMutex);
+          err = jitRuntime->add(&codePtr, &codeHolder);
+        }
+        if (err || !codePtr) {
+          LOG_ERROR(Xenon, "[x86Backend]: EmitFunction runtime add error: {}",
+            asmjit::DebugUtils::errorAsString(err));
+          return false;
+        }
+
+        *outCode = codePtr;
+        *outCodeSize = codeHolder.codeSize();
+        return true;
+      }
+
       // Releases generated code
       void x86CodeGenBackend::ReleaseCode(void *codePtr) {
         if (codePtr && jitRuntime) {
@@ -1270,12 +1446,13 @@ namespace Xe {
         }
       }
 
-      // Resets compiler, context and holder before each block building
+      // Resets compiler, context and holder before each block/function compilation.
       void x86CodeGenBackend::Reset() {
         compiler = nullptr;
         ppuThreadCtx = nullptr;
         ppeState = nullptr;
         codeHolder.reset();
+        functionBlockLabels_.clear();
       }
 
     } // namespace JIT

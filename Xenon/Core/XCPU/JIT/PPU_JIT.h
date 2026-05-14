@@ -488,8 +488,12 @@ public:
   void InstrPrologueConst(JITBlockBuilder *b, u64 cia, u32 instrData);
   void InstrPrologueMinimal(JITBlockBuilder *b, u32 instrData);
 
-  // HIR backend path 
+  // HIR backend path
   std::shared_ptr<JITBlock> BuildJITBlockHIR(u64 blockStartAddress, u64 maxBlockSize, ePPUThreadID threadId);
+
+  // Per-function HIR path: tries TranslateFunction first; falls back to
+  // BuildJITBlockHIR if the function is ineligible for function mode.
+  std::shared_ptr<JITBlock> BuildJITFunctionHIR(u64 funcStartAddress, u64 maxBlockSize, ePPUThreadID threadId);
 
   //HIR standalone path (testing only)
   bool BuildHIRBlock(u64 blockStartAddress, u64 maxInstrs, ePPUThreadID threadId,
