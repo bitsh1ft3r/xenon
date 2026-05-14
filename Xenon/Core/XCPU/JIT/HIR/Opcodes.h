@@ -117,6 +117,9 @@ namespace Xe {
         OPCODE_CALL_EXTERN,
         OPCODE_RETURN,
         OPCODE_RETURN_TRUE,
+        OPCODE_BRANCH,
+        OPCODE_BRANCH_TRUE,
+        OPCODE_BRANCH_FALSE,
         OPCODE_SET_RETURN_ADDRESS,
         OPCODE_ASSIGN,
         OPCODE_CAST,
@@ -277,8 +280,6 @@ namespace Xe {
         OPCODE_MTSPR,
         OPCODE_MTMSRD,
         OPCODE_CALL_HLE_FUNCTION,
-        OPCODE_BRANCH_LABEL,
-        OPCODE_BRANCH_TRUE_LABEL,
         __OPCODE_MAX_VALUE,  // Keep at end.
       };
 

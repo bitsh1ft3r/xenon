@@ -94,6 +94,24 @@ DEFINE_OPCODE(
     OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)
 
   DEFINE_OPCODE(
+    OPCODE_BRANCH,
+    "branch",
+    OPCODE_SIG_X_L,
+    OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)
+
+  DEFINE_OPCODE(
+    OPCODE_BRANCH_TRUE,
+    "branch_true",
+    OPCODE_SIG_X_V_L,
+    OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)
+
+  DEFINE_OPCODE(
+    OPCODE_BRANCH_FALSE,
+    "branch_false",
+    OPCODE_SIG_X_V_L,
+    OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)
+
+  DEFINE_OPCODE(
     OPCODE_SET_RETURN_ADDRESS,
     "set_return_address",
     OPCODE_SIG_X_V,
@@ -746,18 +764,3 @@ DEFINE_OPCODE(
     OPCODE_SIG_X_O,
     OPCODE_FLAG_VOLATILE)
 
-// Intra-function unconditional jump: src1.offset = (u64)target HIRBlock*.
-// Only emitted in per-function translation mode; never appears in per-block HIR.
-DEFINE_OPCODE(
-    OPCODE_BRANCH_LABEL,
-    "branch_label",
-    OPCODE_SIG_X_O,
-    OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)
-
-// Intra-function conditional jump: src1.value = INT8 cond, src2.offset = (u64)taken HIRBlock*.
-// Fallthrough (cond==0) continues to the next block in the function chain.
-DEFINE_OPCODE(
-    OPCODE_BRANCH_TRUE_LABEL,
-    "branch_true_label",
-    OPCODE_SIG_X_V_O,
-    OPCODE_FLAG_BRANCH | OPCODE_FLAG_VOLATILE)

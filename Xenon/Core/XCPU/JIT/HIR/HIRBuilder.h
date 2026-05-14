@@ -60,13 +60,18 @@ namespace Xe {
         // Used by TranslateFunction after AllocBlock to fill each block in order.
         void SwitchToBlock(HIRBlock *block);
 
-        // Supply a guest-address → HIRBlock* map so Branch/BranchConditional
-        // can emit direct OPCODE_BRANCH_LABEL / OPCODE_BRANCH_TRUE_LABEL
+        // Supply a guest-address → Label* map so Branch/BranchConditional
+        // can emit direct OPCODE_BRANCH / OPCODE_BRANCH_TRUE / OPCODE_BRANCH_FALSE
         // instructions for intra-function edges instead of NIA stores.
         // Pass nullptr to clear (reverts to per-block NIA-store mode).
-        void SetIntraFunctionTargets(const std::unordered_map<u64, HIRBlock *> *map) {
+        void SetIntraFunctionTargets(const std::unordered_map<u64, Label *> *map) {
           intraFunctionTargets_ = map;
         }
+
+        // Allocates a new Label from the arena and assigns it a unique id.
+        Label *NewLabel();
+        // Attaches a label to a block's entry point (appends to block->label_tail).
+        void MarkLabel(Label *label, HIRBlock *block);
 
         void Comment(const std::string_view value);
         void Comment(const Base::StringBuffer &value);
@@ -364,9 +369,10 @@ namespace Xe {
         // (no NIA truncation needed); false = 32-bit mode (mask NIA to low 32 bits).
         // Defaults to true; the translator overrides via SetMSRSF().
         bool msrSF_;
-        // Per-function mode: guest address → pre-allocated HIRBlock* map.
+        // Per-function mode: guest address → pre-allocated Label* map.
         // Set by TranslateFunction before translating; nullptr in per-block mode.
-        const std::unordered_map<u64, HIRBlock *> *intraFunctionTargets_ = nullptr;
+        const std::unordered_map<u64, Label *> *intraFunctionTargets_ = nullptr;
+        uint32_t next_label_id_ = 0;
       };
 
     }  // namespace HIR

@@ -425,12 +425,15 @@ namespace Xe {
         builder.CommentFormat("Function start: {:#x} (MSR.SF={}, {} blocks)",
           funcStartAddress, fnMsrSF ? 1 : 0, scan.blocks.size());
 
-        // 4. Pre-allocate one HIRBlock per scanner block so forward-branch targets
-        //    are known before any instruction is translated.
-        std::unordered_map<u64, HIR::HIRBlock *> blockMap;
+        // 4. Pre-allocate one HIRBlock and Label per scanner block so forward-branch
+        //    targets are known before any instruction is translated.
+        std::unordered_map<u64, HIR::Label *> blockMap;
         blockMap.reserve(scan.blocks.size());
         for (const auto &bi : scan.blocks) {
-          blockMap[bi.startAddress] = builder.AllocBlock();
+          HIR::HIRBlock *hirBlock = builder.AllocBlock();
+          HIR::Label *lbl = builder.NewLabel();
+          builder.MarkLabel(lbl, hirBlock);
+          blockMap[bi.startAddress] = lbl;
         }
 
         // 5. Wire up intra-function branch lowering.
@@ -446,7 +449,7 @@ namespace Xe {
         }
 
         for (const auto &bi : scan.blocks) {
-          HIR::HIRBlock *hirBlock = blockMap[bi.startAddress];
+          HIR::HIRBlock *hirBlock = blockMap[bi.startAddress]->block;
           builder.SwitchToBlock(hirBlock);
           builder.CommentFormat("Function block: {:#x}", bi.startAddress);
 
@@ -477,6 +480,8 @@ namespace Xe {
                 builder.SyncExceptionCheck();
               }
               if (outMeta) outMeta->instrCount++;
+              blockAddr += 4;
+              continue;
             }
 
             // Fetch instruction
@@ -583,8 +588,8 @@ namespace Xe {
       void PPCTranslator::DumpHIR() const {
         using namespace HIR;
 
-        // Get current block
-        HIRBlock *block = builder.getCurrentBlock();
+        // Walk from the head of the block chain (covers per-block and per-function mode).
+        HIRBlock *block = builder.getBlockHead();
 
         if (!block) {
           LOG_INFO(Xenon, "[HIR Dump]: No HIR block generated");
@@ -619,76 +624,81 @@ namespace Xe {
 
         LOG_INFO(Xenon, "[HIR Dump]: === Begin HIR ===");
 
-        const Instr *instr = block->instr_head;
         u32 instrCount = 0;
-        while (instr) {
-          if (!instr->opcode) {
-            instr = instr->next;
-            continue;
-          }
-
-          if (instr->opcode->num == OPCODE_COMMENT) {
-            const char *text = reinterpret_cast<const char *>(instr->src1.offset);
-            LOG_INFO(Xenon, "  // {}", text ? text : "");
-          } else if (instr->opcode->num == OPCODE_NOP) {
-            LOG_INFO(Xenon, "  nop");
-          } else {
-            const char *opName = instr->opcode->name ? instr->opcode->name : "???";
-
-            u32 sig = instr->opcode->signature;
-            u32 src1Type = (sig >> 3) & 0x7;
-            u32 src2Type = (sig >> 6) & 0x7;
-            u32 src3Type = (sig >> 9) & 0x7;
-
-            // Build the operand list.
-            std::string operands;
-            auto appendOperand = [&](std::string_view op) {
-              if (!operands.empty()) operands += ", ";
-              operands += op;
-            };
-
-            if (src1Type == OPCODE_SIG_TYPE_V && instr->src1.value) {
-              appendOperand(fmtVal(instr->src1.value));
-            } else if (src1Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src1.offset));
-            } else if (src1Type == OPCODE_SIG_TYPE_S && instr->src1.label) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
-            } else if (src1Type == OPCODE_SIG_TYPE_L) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+        u32 blockIndex = 0;
+        while (block) {
+          LOG_INFO(Xenon, "[HIR Dump]: -- Block {} --", blockIndex++);
+          const Instr *instr = block->instr_head;
+          while (instr) {
+            if (!instr->opcode) {
+              instr = instr->next;
+              continue;
             }
 
-            if (src2Type == OPCODE_SIG_TYPE_V && instr->src2.value) {
-              appendOperand(fmtVal(instr->src2.value));
-            } else if (src2Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src2.offset));
-            } else if (src2Type == OPCODE_SIG_TYPE_L) {
-              appendOperand(FMT("label@{}", static_cast<const void *>(instr->src2.label)));
-            }
-
-            if (src3Type == OPCODE_SIG_TYPE_V && instr->src3.value) {
-              appendOperand(fmtVal(instr->src3.value));
-            } else if (src3Type == OPCODE_SIG_TYPE_O) {
-              appendOperand(FMT("+{:#x}", instr->src3.offset));
-            }
-
-            // Emit: "  [vN = ]opname [operands]"
-            if (instr->dest) {
-              if (!operands.empty()) {
-                LOG_INFO(Xenon, "  v{} = {} {}", instr->dest->ordinal, opName, operands);
-              } else {
-                LOG_INFO(Xenon, "  v{} = {}", instr->dest->ordinal, opName);
-              }
+            if (instr->opcode->num == OPCODE_COMMENT) {
+              const char *text = reinterpret_cast<const char *>(instr->src1.offset);
+              LOG_INFO(Xenon, "  // {}", text ? text : "");
+            } else if (instr->opcode->num == OPCODE_NOP) {
+              LOG_INFO(Xenon, "  nop");
             } else {
-              if (!operands.empty()) {
-                LOG_INFO(Xenon, "  {} {}", opName, operands);
+              const char *opName = instr->opcode->name ? instr->opcode->name : "???";
+
+              u32 sig = instr->opcode->signature;
+              u32 src1Type = (sig >> 3) & 0x7;
+              u32 src2Type = (sig >> 6) & 0x7;
+              u32 src3Type = (sig >> 9) & 0x7;
+
+              // Build the operand list.
+              std::string operands;
+              auto appendOperand = [&](std::string_view op) {
+                if (!operands.empty()) operands += ", ";
+                operands += op;
+              };
+
+              if (src1Type == OPCODE_SIG_TYPE_V && instr->src1.value) {
+                appendOperand(fmtVal(instr->src1.value));
+              } else if (src1Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src1.offset));
+              } else if (src1Type == OPCODE_SIG_TYPE_S && instr->src1.label) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+              } else if (src1Type == OPCODE_SIG_TYPE_L) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src1.label)));
+              }
+
+              if (src2Type == OPCODE_SIG_TYPE_V && instr->src2.value) {
+                appendOperand(fmtVal(instr->src2.value));
+              } else if (src2Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src2.offset));
+              } else if (src2Type == OPCODE_SIG_TYPE_L) {
+                appendOperand(FMT("label@{}", static_cast<const void *>(instr->src2.label)));
+              }
+
+              if (src3Type == OPCODE_SIG_TYPE_V && instr->src3.value) {
+                appendOperand(fmtVal(instr->src3.value));
+              } else if (src3Type == OPCODE_SIG_TYPE_O) {
+                appendOperand(FMT("+{:#x}", instr->src3.offset));
+              }
+
+              // Emit: "  [vN = ]opname [operands]"
+              if (instr->dest) {
+                if (!operands.empty()) {
+                  LOG_INFO(Xenon, "  v{} = {} {}", instr->dest->ordinal, opName, operands);
+                } else {
+                  LOG_INFO(Xenon, "  v{} = {}", instr->dest->ordinal, opName);
+                }
               } else {
-                LOG_INFO(Xenon, "  {}", opName);
+                if (!operands.empty()) {
+                  LOG_INFO(Xenon, "  {} {}", opName, operands);
+                } else {
+                  LOG_INFO(Xenon, "  {}", opName);
+                }
               }
             }
-          }
 
-          ++instrCount;
-          instr = instr->next;
+            ++instrCount;
+            instr = instr->next;
+          }
+          block = block->next;
         }
 
         LOG_INFO(Xenon, "[HIR Dump]: === End HIR ({} instructions) ===", instrCount);

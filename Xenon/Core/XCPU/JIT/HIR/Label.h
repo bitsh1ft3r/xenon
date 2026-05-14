@@ -13,11 +13,11 @@ namespace Xe {
   namespace XCPU {
     namespace HIR {
 
-      class Block;
+      class HIRBlock;
 
       class Label {
       public:
-        Block *block;
+        HIRBlock *block;
         Label *next;
         Label *prev;
 

@@ -60,7 +60,7 @@ namespace Xe {
           //   v2 = 0
 
           result = false;
-          auto block = builder->getCurrentBlock();
+          auto block = builder->getBlockHead();
           while (block) {
             auto i = block->instr_head;
             while (i) {
@@ -762,7 +762,7 @@ namespace Xe {
               i = i->next;
             }
 
-            block = NULL; // No next block.
+            block = block->next;
           }
 
           return true;

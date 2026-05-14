@@ -44,7 +44,7 @@ namespace Xe {
           //   v2.i32 = v0.i32
 
           bool result = false;
-          auto block = builder->getCurrentBlock();
+          auto block = builder->getBlockHead();
           while (block) {
             auto i = block->instr_head;
             while (i) {
@@ -62,7 +62,7 @@ namespace Xe {
               }
               i = i->next;
             }
-            block = NULL; // No next block
+            block = block->next;
           }
           return result;
         }
@@ -139,7 +139,7 @@ namespace Xe {
           // we find a non-assign def.
 
           bool result = false;
-          auto block = builder->getCurrentBlock();
+          auto block = builder->getBlockHead();
           while (block) {
             auto i = block->instr_head;
             while (i) {
@@ -161,7 +161,7 @@ namespace Xe {
               }
               i = i->next;
             }
-            block = NULL;
+            block = block->next;
           }
           return result;
         }

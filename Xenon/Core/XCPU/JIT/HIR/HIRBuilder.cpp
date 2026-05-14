@@ -61,6 +61,7 @@ namespace Xe {
         block_head_ = nullptr;
         block_tail_ = nullptr;
         intraFunctionTargets_ = nullptr;
+        next_label_id_ = 0;
         nextValueOrdinal = 0;
         currentInstructionAddress_ = 0;
         msrSF_ = true;  // Default to 64-bit mode; translator overrides per block.
@@ -81,6 +82,7 @@ namespace Xe {
         block->incoming_values = nullptr;
         block->arena = arena_;
         block->instr_head = block->instr_tail = NULL;
+        block->label_head = block->label_tail = nullptr;
         block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
         block->next = nullptr;
         block->prev = block_tail_;
@@ -102,6 +104,7 @@ namespace Xe {
         block->incoming_values = nullptr;
         block->arena = arena_;
         block->instr_head = block->instr_tail = NULL;
+        block->label_head = block->label_tail = nullptr;
         block->chainTargetGuestAddr = INVALID_CHAIN_TARGET;
         block->next = nullptr;
         block->prev = block_tail_;
@@ -118,6 +121,28 @@ namespace Xe {
       // Switches the active build target to an already-allocated block.
       void HIRBuilder::SwitchToBlock(HIRBlock *block) {
         currentBlock = block;
+      }
+
+      Label *HIRBuilder::NewLabel() {
+        Label *label = arena_->Alloc<Label>();
+        label->id = next_label_id_++;
+        label->block = nullptr;
+        label->next = label->prev = nullptr;
+        label->name = nullptr;
+        label->tag = nullptr;
+        return label;
+      }
+
+      void HIRBuilder::MarkLabel(Label *label, HIRBlock *block) {
+        label->block = block;
+        label->prev = block->label_tail;
+        label->next = nullptr;
+        if (block->label_tail) {
+          block->label_tail->next = label;
+        } else {
+          block->label_head = label;
+        }
+        block->label_tail = label;
       }
 
       //
@@ -628,8 +653,8 @@ namespace Xe {
         if (!currentInstr.lk && intraFunctionTargets_) {
           auto it = intraFunctionTargets_->find(effectiveTarget);
           if (it != intraFunctionTargets_->end()) {
-            Instr *i = AppendInstr(OPCODE_BRANCH_LABEL_info, 0);
-            i->src1.offset = reinterpret_cast<u64>(it->second);
+            Instr *i = AppendInstr(OPCODE_BRANCH_info, 0);
+            i->src1.label = it->second;
             return;
           }
         }
@@ -655,9 +680,9 @@ namespace Xe {
         if (!currentInstr.lk && cond && intraFunctionTargets_) {
           auto it = intraFunctionTargets_->find(effectiveTaken);
           if (it != intraFunctionTargets_->end()) {
-            Instr *i = AppendInstr(OPCODE_BRANCH_TRUE_LABEL_info, 0);
+            Instr *i = AppendInstr(OPCODE_BRANCH_TRUE_info, 0);
             i->set_src1(cond);
-            i->src2.offset = reinterpret_cast<u64>(it->second);
+            i->src2.label = it->second;
             return;
           }
         }
