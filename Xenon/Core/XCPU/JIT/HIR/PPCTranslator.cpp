@@ -42,6 +42,10 @@ namespace Xe {
         sap->AddPass(std::make_unique<Compiler::Passes::ConstantPropagationPass>());
         compiler_->AddPass(std::move(sap));
         compiler_->AddPass(std::make_unique<Compiler::Passes::DeadCodeEliminationPass>());
+        compiler_->AddPass(std::make_unique<Compiler::Passes::DataFlowAnalysisPass>());
+        compiler_->AddPass(std::make_unique<Compiler::Passes::ControlFlowAnalysisPass>());
+        compiler_->AddPass(std::make_unique<Compiler::Passes::ValueReductionPass>());
+        compiler_->AddPass(std::make_unique<Compiler::Passes::FinalizationPass>());
       }
 
       void PPCTranslator::Reset() {

@@ -64,7 +64,7 @@ namespace Xe {
 
           bool any_instr_removed = false;
           bool any_locals_removed = false;
-          auto block = builder->getCurrentBlock();
+          auto block = builder->getBlockHead();
           while (block) {
             // Walk instructions in reverse.
             Instr *i = block->instr_tail;
@@ -107,12 +107,12 @@ namespace Xe {
               i = next;
             }
 
-            block = NULL; // No block
+            block = block->next;
           }
 
           // Remove all nops.
           if (any_instr_removed) {
-            block = builder->getCurrentBlock();
+            block = builder->getBlockHead();
             while (block) {
               Instr *i = block->instr_head;
               while (i) {
@@ -123,7 +123,7 @@ namespace Xe {
                 }
                 i = next;
               }
-              block = NULL; // No block
+              block = block->next;
             }
           }
 
