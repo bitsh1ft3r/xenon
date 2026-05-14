@@ -383,9 +383,9 @@ namespace Xe {
       bool PPCTranslator::IsFunctionModeEligible(const Analysis::PPCScanner::ScanResult &scan) {
         if (scan.blocks.empty())        return false;
         if (!scan.reachedCleanEnd)      return false;
-        if (scan.hasIndirectBranch)     return false;
+        //if (scan.hasIndirectBranch)     return false;
         if (scan.hasMsrChange)          return false;
-        if (scan.hasRfid)               return false;
+        //if (scan.hasRfid)               return false;
         return true;
       }
 
@@ -414,6 +414,7 @@ namespace Xe {
 
         // 2. Eligibility check — fall back to per-block on any disqualifying flag.
         if (!IsFunctionModeEligible(scan)) {
+          LOG_ERROR(Xenon, "[PPCTranslator]: TranslateFunction failed");
           return nullptr;
         }
 
@@ -421,9 +422,6 @@ namespace Xe {
         builder.Reset();
         const bool fnMsrSF = thread.SPR.MSR.SF != 0;
         builder.SetMSRSF(fnMsrSF);
-
-        builder.CommentFormat("Function start: {:#x} (MSR.SF={}, {} blocks)",
-          funcStartAddress, fnMsrSF ? 1 : 0, scan.blocks.size());
 
         // 4. Pre-allocate one HIRBlock and Label per scanner block so forward-branch
         //    targets are known before any instruction is translated.
@@ -451,6 +449,8 @@ namespace Xe {
         for (const auto &bi : scan.blocks) {
           HIR::HIRBlock *hirBlock = blockMap[bi.startAddress]->block;
           builder.SwitchToBlock(hirBlock);
+
+          builder.CommentFormat("Function start: {:#x} (MSR.SF={}, {} blocks)", funcStartAddress, fnMsrSF ? 1 : 0, scan.blocks.size());
           builder.CommentFormat("Function block: {:#x}", bi.startAddress);
 
           // Walk PPC instructions from block start to end (inclusive).
@@ -559,6 +559,8 @@ namespace Xe {
         // Reset CIA/NIA so they are not left pointing mid-function.
         thread.CIA = funcStartAddress - 4;
         thread.NIA = funcStartAddress;
+
+        //DumpHIR();
 
         // 8. Optimize the whole multi-block function as one unit.
         if (!compiler_->Compile(&builder)) {

@@ -19,7 +19,7 @@ namespace Xe {
         // TODO(benvanik): remove when enums redefined.
         using namespace HIR;
 
-        using HIR::Block;
+        using HIR::HIRBlock;
         using HIR::HIRBuilder;
         using HIR::Instr;
         using HIR::Value;

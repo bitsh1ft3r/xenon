@@ -200,7 +200,7 @@ std::shared_ptr<JITBlock> PPU_JIT::BuildJITFunctionHIR(u64 funcStartAddress,
   block->msrSF = meta.msrSF;
   // Per-function blocks have no external chain slot (intra-function branches are direct).
   block->chainSlot = nullptr;
-  block->chainTargetGuestAddr = HIR::INVALID_CHAIN_TARGET;
+  block->chainTargetGuestAddr = ~0ULL;
 
   const u64 cacheKey = ComposeBlockCacheKey(funcStartAddress, meta.msrSF);
   cache.jitBlocksCache.emplace(cacheKey, block);

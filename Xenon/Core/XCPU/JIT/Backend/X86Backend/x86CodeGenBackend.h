@@ -17,6 +17,7 @@
 #include "Core/XCPU/PPU/PPU.h"
 #include "Core/XCPU/JIT/PPU_JIT.h"
 #include "Core/XCPU/JIT/HIR/Instr.h"
+#include "Core/XCPU/JIT/HIR/Label.h"
 #include "Core/XCPU/JIT/HIR/Opcodes.h"
 #include "Core/XCPU/JIT/HIR/Value.h"
 #include "Core/XCPU/JIT/Backend/CodeGenBackend.h"
