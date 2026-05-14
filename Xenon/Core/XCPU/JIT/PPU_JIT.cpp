@@ -165,6 +165,55 @@ std::shared_ptr<JITBlock> PPU_JIT::BuildJITBlockHIR(u64 blockStartAddress, u64 m
   return block;
 }
 
+// Per-function HIR path: attempt to compile an entire guest function into one
+// native function. Falls back to BuildJITBlockHIR when TranslateFunction returns
+// nullptr (function has indirect branches, MSR changes, rfid, or scan failure).
+std::shared_ptr<JITBlock> PPU_JIT::BuildJITFunctionHIR(u64 funcStartAddress,
+                                                        u64 maxBlockSize,
+                                                        ePPUThreadID threadId) {
+  MICROPROFILE_SCOPEI("[Xe::JIT]", "BuildJITFunctionHIR", MP_AUTO);
+  EnsureHIRPipeline();
+  u8 tid = static_cast<u8>(threadId);
+  if (!hirReady_ || !hirTranslator_[tid]) return nullptr;
+
+  auto &cache = threadCaches[tid];
+
+  // Try per-function mode.
+  u64 codeSize = 0;
+  HIRBlockMetadata meta{};
+  void *code = hirTranslator_[tid]->TranslateFunction(funcStartAddress, ppeState,
+                                                       &codeSize, &meta, threadId,
+                                                       /*outChainSlot=*/nullptr);
+
+  if (!code) {
+    // Function mode declined — fall back to per-block.
+    return BuildJITBlockHIR(funcStartAddress, maxBlockSize, threadId);
+  }
+
+  JITFunc funcPtr = reinterpret_cast<JITFunc>(code);
+
+  u64 blockSizeBytes = meta.instrCount * 4;
+  std::shared_ptr<JITBlock> block = std::make_shared<JITBlock>(
+    &jitRuntime, &jitRuntimeMutex, funcStartAddress, blockSizeBytes, funcPtr, codeSize);
+
+  block->hash = meta.hash;
+  block->msrSF = meta.msrSF;
+  // Per-function blocks have no external chain slot (intra-function branches are direct).
+  block->chainSlot = nullptr;
+  block->chainTargetGuestAddr = HIR::INVALID_CHAIN_TARGET;
+
+  const u64 cacheKey = ComposeBlockCacheKey(funcStartAddress, meta.msrSF);
+  cache.jitBlocksCache.emplace(cacheKey, block);
+  cache.fastBlockCache.insert(cacheKey, block.get());
+
+  RegisterBlockPages(cacheKey, blockSizeBytes, cache);
+
+  // Resolve any pending chain edges that target the function entry point.
+  ResolveChainsFor(cacheKey, funcPtr, cache);
+
+  return block;
+}
+
 // Block-linking registry helpers. Per-thread cache, single-owner thread.
 void PPU_JIT::RegisterChainEdge(u64 sourceKey, u64 targetKey, void **slot,
                                 JITBlock * /*targetBlock*/, ThreadJITCache &cache) {
@@ -766,7 +815,9 @@ void PPU_JIT::ExecuteJITInstrs(u64 numInstrs, std::atomic<eThreadState> &threadS
       // Block was not found. Attempt to create a new one using the active backend.
       std::shared_ptr<JITBlock> block;
       if (activeBackend_ == eJITBackend::HIR) {
-        block = BuildJITBlockHIR(blockStartAddress, 0x1000, threadId);
+        // Try per-function mode first; BuildJITFunctionHIR falls back to
+        // per-block automatically when the function is ineligible.
+        block = BuildJITFunctionHIR(blockStartAddress, 0x1000, threadId);
       } else {
         block = BuildJITBlock(blockStartAddress, 0x1000, threadId);
       }

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <mutex>
+#include <unordered_map>
 
 #include "asmjit/x86.h"
 
@@ -49,8 +50,15 @@ namespace Xe {
         bool EmitBlock(HIR::HIRBlock *block, void **outCode, u64 *outCodeSize,
                        ePPUThreadID threadId = ePPUThread_Zero,
                        void ***outChainSlot = nullptr) override;
+        bool EmitFunction(HIR::HIRBlock *blockHead, void **outCode, u64 *outCodeSize,
+                          ePPUThreadID threadId = ePPUThread_Zero,
+                          void ***outChainSlot = nullptr) override;
         void ReleaseCode(void *codePtr) override;
         void Reset() override;
+
+        // Returns the asmjit label bound to the entry of |block| during EmitFunction.
+        // Returns an invalid label if called outside of EmitFunction or for an unknown block.
+        asmjit::Label GetFunctionBlockLabel(HIR::HIRBlock *block) const;
 
         // Enables debug features
         void EnableGeneratedCodeDebugging() {
@@ -102,9 +110,13 @@ namespace Xe {
         asmjit::JitRuntime *jitRuntime = nullptr;
         std::mutex *jitRuntimeMutex = nullptr;
 
-        // Transient per-block state
+        // Transient per-block/per-function state
         asmjit::CodeHolder codeHolder{};
         asmjit::x86::Compiler *compiler = nullptr;
+
+        // Block-entry labels for the current EmitFunction call.
+        // Populated during the first pass (label creation) and cleared after finalize.
+        std::unordered_map<HIR::HIRBlock *, asmjit::Label> functionBlockLabels_{};
 
         // Pointer to the sPPUThread context struct
         ASMJitPtr<sPPUThread> *ppuThreadCtx = nullptr;
