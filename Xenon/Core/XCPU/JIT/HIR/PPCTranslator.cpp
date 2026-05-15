@@ -23,7 +23,7 @@
 // avoid spamming the log. The scan is read-only and does not influence
 // translation; it exists purely to drive the per-function JIT feasibility
 // study.
-#define PPC_SCANNER_DEBUG 1
+//#define PPC_SCANNER_DEBUG 1
 
 namespace Xe {
   namespace XCPU {
@@ -383,13 +383,15 @@ namespace Xe {
       bool PPCTranslator::IsFunctionModeEligible(const Analysis::PPCScanner::ScanResult &scan) {
         if (scan.blocks.empty())        return false;
         if (!scan.reachedCleanEnd)      return false;
-        //if (scan.hasIndirectBranch)     return false;
+        if (!scan.startsWithMfsprLR)      return false;
+        if (scan.hitInvalidWord)      return false;
+        if (scan.hasIndirectBranch)     return false;
         if (scan.hasMsrChange)          return false;
-        //if (scan.hasRfid)               return false;
+        if (scan.hasRfid)               return false;
         return true;
       }
 
-      // Per-function pipeline: scan → multi-block HIR → single native function.
+      // Per-function pipeline: scan -> multi-block HIR -> single native function.
       void *PPCTranslator::TranslateFunction(u64 funcStartAddress, sPPEState *inPPEState,
                                              u64 *outCodeSize,
                                              HIRBlockMetadata *outMeta,
@@ -408,19 +410,21 @@ namespace Xe {
         Analysis::PPCScanner scanner(reader);
         Analysis::PPCScanner::ScanOptions options{};
         options.verboseTrace = false;
-        options.stopOnInvalidWord = false;
+        options.stopOnInvalidWord = true;
         options.isRestGprLr = Analysis::PPCScanner::MakeAutoRestGprLrDetector(reader);
         const auto scan = scanner.Scan(funcStartAddress, options);
 
         // 2. Eligibility check — fall back to per-block on any disqualifying flag.
         if (!IsFunctionModeEligible(scan)) {
-          LOG_ERROR(Xenon, "[PPCTranslator]: TranslateFunction failed");
           return nullptr;
         }
 
         // 3. Reset builder and capture MSR.SF for the whole function.
         builder.Reset();
         const bool fnMsrSF = thread.SPR.MSR.SF != 0;
+        if (!fnMsrSF) {
+          return nullptr;
+        }
         builder.SetMSRSF(fnMsrSF);
 
         // 4. Pre-allocate one HIRBlock and Label per scanner block so forward-branch

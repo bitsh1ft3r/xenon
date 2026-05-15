@@ -67,7 +67,7 @@ namespace Xe {
           // Remove all dead stores.
           // This will break debugging as we can't recover this information when
           // trying to extract stack traces/register values, so we don't do that.
-          if (false) { //(!cvars::debug && !cvars::store_all_context_values) {
+          if (true) { //(!cvars::debug && !cvars::store_all_context_values) {
             block = builder->getBlockHead();
             while (block) {
               RemoveDeadStoresBlock(block);
