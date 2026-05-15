@@ -140,8 +140,41 @@ namespace Xe {
           // few instructions at the target address through |reader|. The
           // helpers are stereotyped: a short straight-line sequence ending
           // in `mtlr` (or pre-existing LR restore) followed by `blr`, with
-          // no intervening branches. Results are cached per address.
+          // no intervening branches.
+          // Deprecated: delegates to MakeRegistryBackedDetector internally.
           static IsRestGprLrFn MakeAutoRestGprLrDetector(ReadU32Fn reader);
+
+          // ── Global cross-module epilogue helper registry ───────────────────
+          //
+          // The Xbox 360 loads several system executables simultaneously
+          // (kernel, xam, ximecore, xbdm, …).  Each contains its own copy of
+          // the __restgprlr_14..31 and __restfpr_* table at independent virtual
+          // addresses.  A single per-predicate cache cannot cover them all.
+          //
+          // NotifyModuleLoaded() scans [moduleBase, moduleBase+moduleSize) for
+          // epilogue helper entry points using a fast blr/mtlr filter and
+          // registers every match.  Cost is O(code_size) dominated by the
+          // linear blr scan; typically under 2 ms for a full kernel image.
+          // Call it once, immediately after a system XEX is mapped.
+          //
+          // NotifyModuleUnloaded() evicts every address in the given range from
+          // the registry so stale hits cannot occur after a module tears down.
+          //
+          // Both calls are optional: MakeRegistryBackedDetector also grows the
+          // registry lazily.  When a branch probe first confirms a helper, its
+          // entire sibling table (all N=14..31 entry points) is propagated in
+          // one pass, so the first call per module does O(36×18) work and every
+          // subsequent call for any sibling is a pure O(1) set lookup.
+          static void NotifyModuleLoaded(u64 moduleBase, u64 moduleSize,
+                                         const ReadU32Fn &reader);
+          static void NotifyModuleUnloaded(u64 moduleBase, u64 moduleSize);
+
+          // Build a predicate backed by the global epilogue registry.
+          // Registry hit  → O(1), zero MMU reads.
+          // Registry miss → dynamic probe; on confirmation the address and all
+          //                 sibling table entries are inserted into the registry.
+          // Supersedes MakeAutoRestGprLrDetector for multi-module environments.
+          static IsRestGprLrFn MakeRegistryBackedDetector(ReadU32Fn reader);
 
           // Pretty-print the scan result via the project's logging system.
           // Output level is LOG_INFO so it shows up by default.

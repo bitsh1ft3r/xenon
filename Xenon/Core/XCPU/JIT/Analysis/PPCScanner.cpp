@@ -9,7 +9,10 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "Base/Logging/Log.h"
 #include "Core/XCPU/Interpreter/PPCInterpreter.h"
@@ -111,6 +114,77 @@ namespace Xe {
           // Obviously invalid data, can't be an intruction
           inline bool IsObviouslyInvalid(u32 code) { return code == 0x00000000 || code == 0xFFFFFFFF ||code == 0xCDCDCDCD; }
 
+          // ── Epilogue helper probe ──────────────────────────────────────────
+          //
+          // Checks whether the instruction sequence starting at targetAddress
+          // fits the stereotype of a PowerPC ABI epilogue helper:
+          //   straight-line loads  →  mtlr rN  →  blr
+          // with no other branch-class instructions in between.
+          // Returns false on any MMU read failure (treat as inconclusive).
+          // Shared by MakeRegistryBackedDetector, PropagateHelperTable, and
+          // NotifyModuleLoaded so the probe logic lives in exactly one place.
+          static bool ProbeIsEpilogueHelper(u64 targetAddress,
+                                            const PPCScanner::ReadU32Fn &reader) {
+            constexpr u32 kMaxWindow = 36;
+            bool sawMtlr = false;
+            for (u32 i = 0; i < kMaxWindow; ++i) {
+              u32 code = 0;
+              if (!reader(targetAddress + static_cast<u64>(i) * 4, code)) {
+                return false;
+              }
+              if (IsObviouslyInvalid(code)) return false;
+              if (IsMtlr(code))            { sawMtlr = true; continue; }
+              if (code == kBlrEncoding)    return sawMtlr || (i > 0);
+              if (IsBranchClass(code))     return false;
+            }
+            return false;
+          }
+
+          // ── Global cross-module registry ───────────────────────────────────
+          //
+          // One registry for the entire emulator session. Protected by a
+          // shared_mutex so concurrent scanner threads pay only a shared read
+          // lock on the hot path (registry hit) and a brief exclusive write on
+          // insertion.
+          struct EpilogueRegistry {
+            mutable std::shared_mutex mutex;
+            std::unordered_set<u64>   confirmed;
+          };
+
+          EpilogueRegistry g_epilogueRegistry;
+
+          // When a helper at confirmedAddress is newly inserted into the global
+          // registry, probe and register all adjacent entry points in the same
+          // sequential table without holding the registry lock (probing is slow).
+          // The PowerPC ABI save/restore helpers are arranged so that entry N+1
+          // begins exactly 4 bytes (one instruction) into entry N, making the
+          // full table a simple arithmetic sequence.  One sibling-walk covers
+          // __restgprlr_14..31 (18 entries) in at most 18 × 36 = 648 reads,
+          // done once per module per helper variant.
+          static void PropagateHelperTable(u64 confirmedAddress,
+                                           const PPCScanner::ReadU32Fn &reader) {
+            constexpr u32 kMaxSiblings = 18;
+            std::vector<u64> siblings;
+            // Walk backward (smaller N → more registers restored, longer body).
+            for (u32 step = 1; step <= kMaxSiblings; ++step) {
+              const u64 candidate = confirmedAddress - static_cast<u64>(step) * 4;
+              if (!ProbeIsEpilogueHelper(candidate, reader)) break;
+              siblings.push_back(candidate);
+            }
+            // Walk forward (larger N → fewer registers restored, shorter body).
+            for (u32 step = 1; step <= kMaxSiblings; ++step) {
+              const u64 candidate = confirmedAddress + static_cast<u64>(step) * 4;
+              if (!ProbeIsEpilogueHelper(candidate, reader)) break;
+              siblings.push_back(candidate);
+            }
+            if (!siblings.empty()) {
+              std::unique_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+              for (const u64 addr : siblings) {
+                g_epilogueRegistry.confirmed.insert(addr);
+              }
+            }
+          }
+
           // Kind of possible edges names
           const char *EdgeKindName(PPCScanner::EdgeKind kind) {
             switch (kind) {
@@ -154,75 +228,103 @@ namespace Xe {
           };
         }
 
+        // Delegates to MakeRegistryBackedDetector.  The per-predicate cache
+        // that lived here is superseded by the global registry: all modules
+        // share one lookup table, probes populate it lazily, and sibling-table
+        // propagation ensures each module's full __restgprlr_N set is registered
+        // on first contact with any one of its entries.
         PPCScanner::IsRestGprLrFn PPCScanner::MakeAutoRestGprLrDetector(
             ReadU32Fn reader) {
-          if (!reader) {
-            return [](u64) { return false; };
+          return MakeRegistryBackedDetector(std::move(reader));
+        }
+
+        void PPCScanner::NotifyModuleLoaded(u64 moduleBase, u64 moduleSize,
+                                            const ReadU32Fn &reader) {
+          if (!reader || moduleSize < 8) return;
+          const u64 end = moduleBase + moduleSize;
+
+          // Two-pass filter: scan every aligned word for `blr` (0x4E800020),
+          // then verify the preceding instruction is `mtlr rN`.  This narrows
+          // the expensive backward probe to the ~few hundred epilogue tails
+          // that actually exist inside a typical system module, rather than
+          // probing every instruction in the code section.
+          for (u64 addr = moduleBase + 4; addr < end; addr += 4) {
+            u32 word = 0;
+            if (!reader(addr, word) || word != kBlrEncoding) continue;
+
+            u32 prev = 0;
+            if (!reader(addr - 4, prev) || !IsMtlr(prev)) continue;
+
+            // Found a potential epilogue tail (mtlr rN; blr).
+            // Walk backward from the mtlr position: step=0 is the mtlr itself,
+            // each additional step prepends one more leading load instruction.
+            // This recovers every __restgprlr_N entry point in the table.
+            constexpr u32 kMaxEntries = 19;  // at most 18 loads + mtlr tail
+            std::vector<u64> toRegister;
+            for (u32 step = 0; step <= kMaxEntries; ++step) {
+              const u64 candidate = (addr - 4) - static_cast<u64>(step) * 4;
+              if (candidate < moduleBase) break;
+              if (!ProbeIsEpilogueHelper(candidate, reader)) break;
+              toRegister.push_back(candidate);
+            }
+            if (!toRegister.empty()) {
+              std::unique_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+              for (const u64 a : toRegister) {
+                g_epilogueRegistry.confirmed.insert(a);
+              }
+            }
           }
-          // Cache results so a hot dispatcher doesn't re-probe the same
-          // helpers on every scan. The cache lives for the predicate's
-          // lifetime; callers are expected to discard the predicate when
-          // the underlying code memory is invalidated.
-          struct Cache {
-            std::mutex mutex;
-            std::unordered_map<u64, bool> entries;
-          };
-          auto cache = std::make_shared<Cache>();
-          return [reader, cache](u64 targetAddress) -> bool {
+
+          LOG_INFO(Xenon,
+                   "[PPCScanner]: NotifyModuleLoaded {:#x}+{:#x} — {} epilogue helpers registered",
+                   moduleBase, moduleSize, [&] {
+                     std::shared_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+                     return g_epilogueRegistry.confirmed.size();
+                   }());
+        }
+
+        void PPCScanner::NotifyModuleUnloaded(u64 moduleBase, u64 moduleSize) {
+          const u64 end = moduleBase + moduleSize;
+          u32 evicted = 0;
+          {
+            std::unique_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+            for (auto it = g_epilogueRegistry.confirmed.begin();
+                 it != g_epilogueRegistry.confirmed.end(); ) {
+              if (*it >= moduleBase && *it < end) {
+                it = g_epilogueRegistry.confirmed.erase(it);
+                ++evicted;
+              } else {
+                ++it;
+              }
+            }
+          }
+          if (evicted) {
+            LOG_INFO(Xenon,
+                     "[PPCScanner]: NotifyModuleUnloaded {:#x}+{:#x} — {} helpers evicted",
+                     moduleBase, moduleSize, evicted);
+          }
+        }
+
+        PPCScanner::IsRestGprLrFn PPCScanner::MakeRegistryBackedDetector(
+            ReadU32Fn reader) {
+          return [r = std::move(reader)](u64 targetAddress) -> bool {
+            // Fast path: O(1) shared-lock lookup in the global registry.
             {
-              std::lock_guard<std::mutex> lock(cache->mutex);
-              auto it = cache->entries.find(targetAddress);
-              if (it != cache->entries.end()) {
-                return it->second;
-              }
+              std::shared_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+              if (g_epilogueRegistry.confirmed.count(targetAddress)) return true;
             }
-            // Walk up to a small window of straight-line instructions
-            // looking for a trailing `blr` with no branches in between.
-            // The canonical helpers restore GPRs r14..r31 (up to 18 ld/lwz
-            // instructions) plus a LR restore and blr, so allow up to 36
-            // instructions to cover __restgprlr_14 and similar large variants.
-            constexpr u32 kMaxWindow = 36;
-            bool isHelper = false;
-            bool sawMtlr = false;
-            bool readFailed = false;
-            for (u32 i = 0; i < kMaxWindow; ++i) {
-              const u64 addr = targetAddress + (static_cast<u64>(i) * 4);
-              u32 code = 0;
-              if (!reader(addr, code)) {
-                // A read failure means we could not verify the stereotype.
-                // Don't cache the negative result — the failure may be
-                // transient (early boot, page not yet mapped) and caching
-                // false would permanently mis-classify the helper.
-                readFailed = true;
-                break;
-              }
-              if (IsObviouslyInvalid(code)) {
-                break;
-              }
-              if (IsMtlr(code)) {
-                sawMtlr = true;
-                continue;
-              }
-              if (code == kBlrEncoding) {
-                // Helpers either restore LR explicitly (sawMtlr) or are
-                // tail-only stubs (rare, but allow them: a leading `blr`
-                // means a no-op restorer). Either way, the absence of any
-                // intervening branch confirms the stereotype.
-                isHelper = sawMtlr || (i > 0);
-                break;
-              }
-              if (IsBranchClass(code)) {
-                // Any other branch breaks the stereotype.
-                break;
-              }
+
+            // Slow path: probe dynamically (only on true misses).
+            if (!r || !ProbeIsEpilogueHelper(targetAddress, r)) return false;
+
+            // Confirmed helper: insert into registry then propagate siblings
+            // so every other entry in the same table is free on next call.
+            {
+              std::unique_lock<std::shared_mutex> lock(g_epilogueRegistry.mutex);
+              g_epilogueRegistry.confirmed.insert(targetAddress);
             }
-            // Only cache a definitive answer; skip caching on read failure so
-            // a later call can re-probe once the address is accessible.
-            if (!readFailed) {
-              std::lock_guard<std::mutex> lock(cache->mutex);
-              cache->entries.emplace(targetAddress, isHelper);
-            }
-            return isHelper;
+            PropagateHelperTable(targetAddress, r);
+            return true;
           };
         }
 

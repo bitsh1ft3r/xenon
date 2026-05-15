@@ -127,7 +127,7 @@ namespace Xe {
             options.verboseTrace = false;
             options.stopOnInvalidWord = false;
             // Recognize `__restgprlr_*`-style epilogue helpers so a branch to one terminates the function cleanly
-            options.isRestGprLr = Analysis::PPCScanner::MakeAutoRestGprLrDetector(reader);
+            options.isRestGprLr = Analysis::PPCScanner::MakeRegistryBackedDetector(reader);
             const auto report = scanner.Scan(blockStartAddress, options);
             LOG_INFO(Xenon, "[PPCScanner]: Block entry {:#x} (MSR.SF={})", blockStartAddress, scannerSF ? 1 : 0);
             Analysis::PPCScanner::DumpResult(report);
@@ -411,7 +411,7 @@ namespace Xe {
         Analysis::PPCScanner::ScanOptions options{};
         options.verboseTrace = false;
         options.stopOnInvalidWord = true;
-        options.isRestGprLr = Analysis::PPCScanner::MakeAutoRestGprLrDetector(reader);
+        options.isRestGprLr = Analysis::PPCScanner::MakeRegistryBackedDetector(reader);
         const auto scan = scanner.Scan(funcStartAddress, options);
 
         // 2. Eligibility check — fall back to per-block on any disqualifying flag.
