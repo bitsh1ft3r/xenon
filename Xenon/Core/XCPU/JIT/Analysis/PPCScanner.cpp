@@ -178,15 +178,22 @@ namespace Xe {
             }
             // Walk up to a small window of straight-line instructions
             // looking for a trailing `blr` with no branches in between.
-            // The canonical helpers are < 16 instructions and consist of
-            // ld/lwz/mtlr/addi/mr followed by `blr`.
-            constexpr u32 kMaxWindow = 24;
+            // The canonical helpers restore GPRs r14..r31 (up to 18 ld/lwz
+            // instructions) plus a LR restore and blr, so allow up to 36
+            // instructions to cover __restgprlr_14 and similar large variants.
+            constexpr u32 kMaxWindow = 36;
             bool isHelper = false;
             bool sawMtlr = false;
+            bool readFailed = false;
             for (u32 i = 0; i < kMaxWindow; ++i) {
               const u64 addr = targetAddress + (static_cast<u64>(i) * 4);
               u32 code = 0;
               if (!reader(addr, code)) {
+                // A read failure means we could not verify the stereotype.
+                // Don't cache the negative result — the failure may be
+                // transient (early boot, page not yet mapped) and caching
+                // false would permanently mis-classify the helper.
+                readFailed = true;
                 break;
               }
               if (IsObviouslyInvalid(code)) {
@@ -209,7 +216,9 @@ namespace Xe {
                 break;
               }
             }
-            {
+            // Only cache a definitive answer; skip caching on read failure so
+            // a later call can re-probe once the address is accessible.
+            if (!readFailed) {
               std::lock_guard<std::mutex> lock(cache->mutex);
               cache->entries.emplace(targetAddress, isHelper);
             }
@@ -263,6 +272,22 @@ namespace Xe {
               LOG_WARNING(Xenon, "[PPCScanner]: hit range cap ({:#x} bytes) at {:#x}",
                           options.maxRangeBytes, address);
               result.ranOver = true;
+              break;
+            }
+
+            // Guard: if the scanner is about to enter a new block (not yet inBlock)
+            // at an address other than the function entry, check whether it's an
+            // epilogue helper that leaked into pendingTargets. This catches helpers
+            // that reached the worklist via a forward `bc` or a `b` whose
+            // isRestGprLr probe was inconclusive (e.g. transient read failure).
+            if (address != startAddress && !inBlock &&
+                options.isRestGprLr && options.isRestGprLr(address)) {
+              if (options.verboseTrace) {
+                LOG_DEBUG(Xenon,
+                          "[PPCScanner]: pending target {:#x} is an epilogue helper; stopping cleanly",
+                          address);
+              }
+              result.reachedCleanEnd = true;
               break;
             }
 
@@ -451,19 +476,33 @@ namespace Xe {
                 }
               } else {
                 result.edges.push_back({address, target, EdgeKind::ConditionalBranch});
-                // A forward bc beyond maxBcForwardExtension bytes is treated as an
-                // external escape (error handler, assert, etc.) — recorded as an edge
-                // but NOT added to pendingTargets so the scanner never visits that block.
-                const bool withinLimit =
-                    target <= address ||
-                    options.maxBcForwardExtension == 0 ||
-                    (target - address) <= options.maxBcForwardExtension;
-                if (withinLimit) {
-                  addPending(target);
-                }
-                if (options.verboseTrace) {
-                  LOG_DEBUG(Xenon, "[PPCScanner]: bc  {:#x} -> {:#x}{}",
-                            address, target, withinLimit ? "" : " [horizon-capped]");
+                // A conditional branch to an epilogue helper (__restgprlr_*, etc.)
+                // is a conditional tail-exit. Record the target as a tail call but
+                // never add it to pendingTargets — scanning the helper body as
+                // function code would corrupt the CFG and trigger the range cap.
+                const bool isEpilogueExit =
+                    options.isRestGprLr && options.isRestGprLr(target);
+                if (isEpilogueExit) {
+                  result.tailCallTargets.push_back(target);
+                  if (options.verboseTrace) {
+                    LOG_DEBUG(Xenon, "[PPCScanner]: bc  {:#x} -> {:#x} [epilogue-exit]",
+                              address, target);
+                  }
+                } else {
+                  // A forward bc beyond maxBcForwardExtension bytes is treated as an
+                  // external escape (error handler, assert, etc.) — recorded as an edge
+                  // but NOT added to pendingTargets so the scanner never visits that block.
+                  const bool withinLimit =
+                      target <= address ||
+                      options.maxBcForwardExtension == 0 ||
+                      (target - address) <= options.maxBcForwardExtension;
+                  if (withinLimit) {
+                    addPending(target);
+                  }
+                  if (options.verboseTrace) {
+                    LOG_DEBUG(Xenon, "[PPCScanner]: bc  {:#x} -> {:#x}{}",
+                              address, target, withinLimit ? "" : " [horizon-capped]");
+                  }
                 }
                 currentBlock.endsWithBranch = true;
               }
@@ -577,21 +616,11 @@ namespace Xe {
         }
 
         void PPCScanner::DumpResult(const ScanResult &result) {
-          if (result.startAddress == 0x801B00D8) {
-            LOG_INFO(Xenon, "[PPCScanner]: === Scan {:#x}..{:#x} ({} instrs, {} blocks) ===",
-              result.startAddress, result.endAddress,
-              result.instructionCount, result.blocks.size());
-          }
-
           LOG_INFO(Xenon, "[PPCScanner]: === Scan {:#x}..{:#x} ({} instrs, {} blocks) ===",
                    result.startAddress, result.endAddress,
                    result.instructionCount, result.blocks.size());
           LOG_INFO(Xenon, "[PPCScanner]:   reachedCleanEnd={}  ranOver={}  hitInvalid={}",
                    result.reachedCleanEnd, result.ranOver, result.hitInvalidWord);
-          if (result.reachedCleanEnd == false || result.ranOver) {
-            LOG_INFO(Xenon, "[PPCScanner]:   reachedCleanEnd={}  ranOver={}  hitInvalid={}",
-              result.reachedCleanEnd, result.ranOver, result.hitInvalidWord);
-          }
           
           LOG_INFO(Xenon, "[PPCScanner]:   prologueMfsprLR={}  msrChange={}  syscall={}  rfid={}",
                    result.startsWithMfsprLR, result.hasMsrChange,
